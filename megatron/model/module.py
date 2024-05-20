@@ -15,10 +15,8 @@ _HALF_TYPES = [get_accelerator().HalfTensor(0).dtype]
 _BF16_TYPES = [get_accelerator().BFloat16Tensor(0).dtype]
 
 
-
 def param_is_not_shared(param):
     return not hasattr(param, 'shared') or not param.shared
-
 
 
 class MegatronModule(torch.nn.Module):
@@ -147,11 +145,11 @@ def float16_to_fp32(val):
         val_typecheck = val
         if isinstance(val_typecheck, (Parameter, Variable)):
             val_typecheck = val.data
-        if val_typecheck.dtype in _BF16_TYPES + _HALF_TYPES:
-            val = val.float()
+        if not val_typecheck is None:
+            if val_typecheck.dtype in _BF16_TYPES + _HALF_TYPES:
+                val = val.float()
         return val
     return conversion_helper(val, float_conversion)
-
 
 
 class Float16Module(MegatronModule):
@@ -176,24 +174,27 @@ class Float16Module(MegatronModule):
     def set_input_tensor(self, input_tensor):
         return self.module.set_input_tensor(input_tensor)
 
-
     def forward(self, *inputs, **kwargs):
         if mpu.is_pipeline_first_stage():
             inputs = fp32_to_float16(inputs, self.float16_convertor)
         outputs = self.module(*inputs, **kwargs)
+        # print(
+        #     "outputs",
+        #     outputs,
+        #     self,
+        #     self._modules["module"].post_process,
+        #     id(self._modules["module"]),
+        # )
         if mpu.is_pipeline_last_stage():
             outputs = float16_to_fp32(outputs)
         return outputs
 
-
     def state_dict(self, prefix='', keep_vars=False):
         return self.module.state_dict(prefix=prefix, keep_vars=keep_vars)
-
 
     def state_dict_for_save_checkpoint(self, prefix='', keep_vars=False):
         return self.module.state_dict_for_save_checkpoint(prefix=prefix,
                                                           keep_vars=keep_vars)
-
 
     def load_state_dict(self, state_dict, strict=True):
         self.module.load_state_dict(state_dict, strict=strict)

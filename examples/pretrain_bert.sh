@@ -2,11 +2,12 @@
 
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 
-CHECKPOINT_PATH=<Specify path>
-VOCAB_FILE=<Specify path to file>/bert-vocab.txt
-DATA_PATH=<Specify path and file prefix>_text_sentence
+CHECKPOINT_PATH=./tmp
+VOCAB_FILE=$HOME/.cache/my_huggingface_datasets/bert-base-uncased-vocab.txt
+DATA_PATH="$HOME/.cache/my_huggingface_datasets/meg-bert_text_document"
 
 BERT_ARGS="
+    --bert-no-binary-head \
     --num-layers 24 \
     --hidden-size 1024 \
     --num-attention-heads 16 \
@@ -15,7 +16,7 @@ BERT_ARGS="
     --micro-batch-size 4 \
     --global-batch-size 8 \
     --lr 0.0001 \
-    --train-iters 2000000 \
+    --train-iters 1000000 \
     --lr-decay-iters 990000 \
     --lr-decay-style linear \
     --min-lr 0.00001 \
@@ -39,7 +40,7 @@ OUTPUT_ARGS="
     --eval-iters 10
 "
 
-torchrun pretrain_bert.py \
+torchrun ../pretrain_bert.py \
     $BERT_ARGS \
     $DATA_ARGS \
     $OUTPUT_ARGS \

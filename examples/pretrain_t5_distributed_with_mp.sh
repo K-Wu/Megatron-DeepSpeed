@@ -2,7 +2,7 @@
 
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 
-GPUS_PER_NODE=8
+GPUS_PER_NODE=2
 # Change for multinode config
 MASTER_ADDR=localhost
 MASTER_PORT=6000
@@ -10,9 +10,9 @@ NNODES=1
 NODE_RANK=0
 WORLD_SIZE=$(($GPUS_PER_NODE*$NNODES))
 
-CHECKPOINT_PATH=<Specify path>
-VOCAB_FILE=<Specify path to file>/t5-vocab.txt
-DATA_PATH=<Specify path and file prefix>_text_sentence
+CHECKPOINT_PATH=./tmp
+VOCAB_FILE=$HOME/.cache/my_huggingface_datasets/bert-base-uncased-vocab.txt
+DATA_PATH="$HOME/.cache/my_huggingface_datasets/meg-bert_text_document"
 
 DISTRIBUTED_ARGS="
     --nproc_per_node $GPUS_PER_NODE \
@@ -25,6 +25,7 @@ DISTRIBUTED_ARGS="
 T5_ARGS="
     --tensor-model-parallel-size 2 \
     --num-layers 12 \
+    --decoder-num-layers 12 \
     --hidden-size 768 \
     --num-attention-heads 12 \
     --kv-channels 64 \
@@ -60,7 +61,7 @@ OUTPUT_ARGS="
     --eval-iters 10
 "
 
-torchrun $DISTRIBUTED_ARGS pretrain_t5.py \
+torchrun $DISTRIBUTED_ARGS ../pretrain_t5.py \
     $T5_ARGS \
     $DATA_ARGS \
     $OUTPUT_ARGS \

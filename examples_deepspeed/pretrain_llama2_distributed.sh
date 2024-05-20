@@ -5,17 +5,19 @@ set -ex
 ######################################
 # Change the below configurations here
 BASE_PATH=./tmp
+# Create the directory in order to save the deepspeed.json file
+mkdir -p $BASE_PATH
 DS_CONFIG=${BASE_PATH}/deepspeed.json
-DATASET_1="./tmp/data/bookcorpus_train_1m_text_sentence"
+DATASET_1="$HOME/.cache/my_huggingface_datasets/meg-gpt2_text_document"
 DATASET="1 ${DATASET_1}"
 CHECKPOINT_PATH=./tmp
-TOKENIZER_PATH=./tmp/tokenizer.model # offical llama tokenizer.model
+TOKENIZER_PATH=$HOME/.cache/my_huggingface_datasets/tokenizer.model # offical llama tokenizer.model
 
 TP=2
-PP=2
+PP=1
 ZERO_STAGE=0
 
-GPUS_PER_NODE=8
+GPUS_PER_NODE=2
 MASTER_ADDR=localhost
 MASTER_PORT=6000
 NNODES=1
@@ -88,8 +90,14 @@ fi
 
 DISTRIBUTED_ARGS="--nproc_per_node $GPUS_PER_NODE --nnodes $NNODES --node_rank $NODE_RANK --master_addr $MASTER_ADDR --master_port $MASTER_PORT"
 
+# The lines after --bf16 are llama-specific configurations
+# --optimizer adam --adam-beta1 0.9 --adam-beta2 0.95 is llama-specific
+# --train-tokens $NUM_TOKEN --lr-decay-tokens $LR_DECAY_TOKEN  is gpt-specific
+# --override-opt_param-scheduler is llama-specific
+# --ffn-hidden-size is llama-specific
+
 torchrun $DISTRIBUTED_ARGS \
-       pretrain_gpt.py \
+       ../pretrain_gpt.py \
        --tensor-model-parallel-size $TP \
        --pipeline-model-parallel-size $PP \
        --num-layers $NUM_LAYERS \
