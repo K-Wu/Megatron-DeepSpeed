@@ -254,6 +254,7 @@ def pretrain(
     ):
         """Adapted from _exec_schedule from /home/kunwu2/miniforge3/envs/dev_flashtrain/lib/python3.10/site-packages/deepspeed/runtime/pipe/engine.py
         Adding support for tensor cache."""
+        assert tensor_cache is not None
         logger.info(
             "deepspeed_monkey_patched_PipelineEngine_exec_schedule active"
         )
@@ -295,6 +296,16 @@ def pretrain(
                         next_idx_microbatch,
                         next_stage,
                     )
+                else:
+                    # A communication command
+                    if (
+                        next_idx_microbatch is not None
+                        and next_stage == PTC.Stage.BACKWARD
+                    ):
+                        # Do the prefetch
+                        tensor_cache.tensor_caches[
+                            next_idx_microbatch
+                        ].prefetch_last_module_in_forward_if_not_None()
 
                 # Equivalent to: self._exec_forward_pass(buffer_id=0)
                 self._exec_instr = MethodType(
