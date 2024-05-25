@@ -152,9 +152,16 @@ def pretrain(
             to set already parse arguments.
     """
 
+    def args_provider(parser):
+        group = parser.add_argument_group(title="tensor cache")
+        group.add_argument(
+            "--enable-tensor-cache", action="store_true", default=False
+        )
+        return parser
+
     # Initalize and get arguments, timers, and Tensorboard writer.
     initialize_megatron(
-        extra_args_provider=extra_args_provider,
+        extra_args_provider=args_provider,
         args_defaults=args_defaults,
         external_args=external_args,
     )
@@ -213,13 +220,33 @@ def pretrain(
 
     # Set up pipeline tensor cache
     # logger.setLevel(logging.getLevelName("INFO"))  # "WARNING"))
-    print("Num microbatches", get_num_microbatches(), len(model), model[0])
-    tensor_cache = PTC.PipelineTensorCache(
-        enable_activation_context_recording=True,
-        adapter=adapters.TorchMainMemoryIOAdapter(),
-        implicit_set_in_backward=True,
-        num_microbatches=get_num_microbatches(),
-    )
+    if args.enable_tensor_cache:
+        tensor_cache = PTC.PipelineTensorCache(
+            enable_activation_context_recording=True,
+            adapter=adapters.TorchMainMemoryIOAdapter(),
+            implicit_wait_and_set_in_backward=True,
+            num_microbatches=get_num_microbatches(),
+        )
+    else:
+        tensor_cache = None
+
+    def deepspeed_get_next_microbatch_idx_and_stage(idx_cmd, cmds):
+        if idx_cmd == len(cmds) - 1:
+            # This is the last command in this step. According to steps(self) in TrainSchedule in /home/kunwu2/miniforge3/envs/dev_flashtrain/lib/python3.10/site-packages/deepspeed/runtime/pipe/schedule.py,
+            # The first command in the next step is not forward or backward pass.
+            return None, None
+
+        next_cmd = cmds[idx_cmd + 1]
+
+        if isinstance(next_cmd, deepspeed.runtime.pipe.schedule.ForwardPass):
+            return next_cmd.buffer_id, PTC.Stage.FORWARD
+        elif isinstance(
+            next_cmd, deepspeed.runtime.pipe.schedule.BackwardPass
+        ):
+            return next_cmd.buffer_id, PTC.Stage.BACKWARD
+        else:
+            # The next command is not a forward or backward pass. E.g., a communication command.
+            return None, None
 
     # Monkey patching the pipeline engine of deepspeed to support tensor cache
     def deepspeed_monkey_patched_PipelineEngine_exec_schedule(
@@ -234,55 +261,78 @@ def pretrain(
         self._reserve_pipe_buffers(pipe_schedule.num_pipe_buffers())
         self.fwd_outputs = []
 
-        pipe_schedule: list[
-            list[deepspeed.runtime.pipe.schedule.BufferOpInstruction]
-        ]
+        pipe_schedule: deepspeed.runtime.pipe.schedule.PipeSchedule
         # For each step in the schedule
-        for step_cmds in pipe_schedule:
+        for idx_step, step_cmds in enumerate(pipe_schedule):
             # For each instruction in the step
-            for cmd in step_cmds:
+            for idx_cmd, cmd in enumerate(step_cmds):
                 if type(cmd) not in self._INSTRUCTION_MAP:
                     raise RuntimeError(
                         f"{self.__class__.__name__} does not understand instruction {repr(cmd)}"
                     )
 
+                next_idx_microbatch, next_stage = (
+                    deepspeed_get_next_microbatch_idx_and_stage(
+                        idx_cmd, step_cmds
+                    )
+                )
+
                 if isinstance(
                     cmd, deepspeed.runtime.pipe.schedule.ForwardPass
                 ):
-                    tensor_cache.set_stage(cmd.buffer_id, PTC.Stage.FORWARD)
+                    tensor_cache.set_stage(
+                        cmd.buffer_id,
+                        PTC.Stage.FORWARD,
+                        next_idx_microbatch,
+                        next_stage,
+                    )
                 elif isinstance(
                     cmd, deepspeed.runtime.pipe.schedule.BackwardPass
                 ):
-                    tensor_cache.set_stage(cmd.buffer_id, PTC.Stage.BACKWARD)
+                    tensor_cache.set_stage(
+                        cmd.buffer_id,
+                        PTC.Stage.BACKWARD,
+                        next_idx_microbatch,
+                        next_stage,
+                    )
 
                 # Equivalent to: self._exec_forward_pass(buffer_id=0)
                 self._exec_instr = MethodType(
                     self._INSTRUCTION_MAP[type(cmd)], self
                 )
                 self._exec_instr(**cmd.kwargs)
+                if isinstance(
+                    cmd, deepspeed.runtime.pipe.schedule.ForwardPass
+                ) or isinstance(
+                    cmd, deepspeed.runtime.pipe.schedule.BackwardPass
+                ):
+                    tensor_cache.wait_current_stage()
 
-    deepspeed.runtime.pipe.engine.PipelineEngine._exec_schedule = (
-        deepspeed_monkey_patched_PipelineEngine_exec_schedule
-    )
+    if args.enable_tensor_cache:
+        deepspeed.runtime.pipe.engine.PipelineEngine._exec_schedule = (
+            deepspeed_monkey_patched_PipelineEngine_exec_schedule
+        )
 
-    for tc_ in tensor_cache.tensor_caches:
-        for model_module in model:
-            tc_.add_parameters_from_module(model_module)
-            register_transpose_of_linear_weights(model_module, tc_)
-    forward_pre_hook = tensor_cache.get_forward_pre_hook()
-    forward_hook = tensor_cache.get_forward_hook()
-    full_backward_hook = tensor_cache.get_full_backward_hook()
-    full_backward_pre_hook = tensor_cache.get_full_backward_pre_hook()
-    pack_hook = tensor_cache.get_pack_hook()
-    unpack_hook = tensor_cache.get_unpack_hook()
-    torch.nn.modules.module.register_module_forward_pre_hook(forward_pre_hook)
-    torch.nn.modules.module.register_module_forward_hook(forward_hook)
-    torch.nn.modules.module.register_module_full_backward_pre_hook(
-        full_backward_pre_hook
-    )
-    torch.nn.modules.module.register_module_full_backward_hook(
-        full_backward_hook
-    )
+        for tc_ in tensor_cache.tensor_caches:
+            for model_module in model:
+                tc_.add_parameters_from_module(model_module)
+                register_transpose_of_linear_weights(model_module, tc_)
+        forward_pre_hook = tensor_cache.get_forward_pre_hook()
+        forward_hook = tensor_cache.get_forward_hook()
+        full_backward_hook = tensor_cache.get_full_backward_hook()
+        full_backward_pre_hook = tensor_cache.get_full_backward_pre_hook()
+        pack_hook = tensor_cache.get_pack_hook()
+        unpack_hook = tensor_cache.get_unpack_hook()
+        torch.nn.modules.module.register_module_forward_pre_hook(
+            forward_pre_hook
+        )
+        torch.nn.modules.module.register_module_forward_hook(forward_hook)
+        torch.nn.modules.module.register_module_full_backward_pre_hook(
+            full_backward_pre_hook
+        )
+        torch.nn.modules.module.register_module_full_backward_hook(
+            full_backward_hook
+        )
 
     timers("model-and-optimizer-setup").stop()
     print_datetime(
@@ -1757,7 +1807,6 @@ def train(
                     update_rotary_pos_emb(curriculum_seqlen)
             args.curriculum_seqlen = curriculum_seqlen
         args.curr_iteration = iteration
-        # tensor_cache.set_in_forward()
         loss_dict, skipped_iter, grad_norm, num_zeros_in_grad = train_step(
             forward_step_func,
             train_data_iterator,

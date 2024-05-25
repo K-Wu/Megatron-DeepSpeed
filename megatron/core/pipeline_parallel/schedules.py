@@ -365,9 +365,13 @@ def forward_backward_no_pipelining(
     See get_forward_backward_func() for argument details
     """
 
-    def set_stage_if_not_None(tensor_cache, idx_iter: int, stage: Stage):
+    def set_stage_if_not_None(tensor_cache, idx_iter: int, stage: Stage, next_idx_iter: Optional[int] = None, next_stage: Optional[Stage] = None):
         if tensor_cache is not None:
-            tensor_cache.set_stage(idx_iter, stage)
+            tensor_cache.set_stage(idx_iter, stage, next_idx_iter, next_stage)
+
+    def wait_current_stage_if_not_None(tensor_cache):
+        if tensor_cache is not None:
+            tensor_cache.wait_current_stage()
 
     if isinstance(model, list):
         assert (
@@ -398,7 +402,10 @@ def forward_backward_no_pipelining(
     input_tensor, output_tensor_grad = None, None
     with no_sync_func():
         for i in range(num_microbatches - 1):
-            set_stage_if_not_None(tensor_cache, i, Stage.FORWARD)
+            if not forward_only:
+                set_stage_if_not_None(tensor_cache, i, Stage.FORWARD, i, Stage.BACKWARD)
+            else:
+                set_stage_if_not_None(tensor_cache, i, Stage.FORWARD, i+1, Stage.FORWARD)
             output_tensor = forward_step(
                 forward_step_func,
                 data_iterator,
@@ -409,8 +416,9 @@ def forward_backward_no_pipelining(
                 config,
                 collect_non_loss_data,
             )
+            wait_current_stage_if_not_None(tensor_cache)
             if not forward_only:
-                set_stage_if_not_None(tensor_cache, i, Stage.BACKWARD)
+                set_stage_if_not_None(tensor_cache, i, Stage.BACKWARD, i+1, Stage.FORWARD)
                 backward_step(
                     input_tensor,
                     output_tensor,
@@ -419,12 +427,22 @@ def forward_backward_no_pipelining(
                     config,
                     model,
                 )
+                wait_current_stage_if_not_None(tensor_cache)
     if args.deepspeed:
         model.set_gradient_accumulation_boundary(True)
 
     # Run computation for last microbatch out of context handler (want to
     # synchronize gradients).
-    set_stage_if_not_None(tensor_cache, num_microbatches - 1, Stage.FORWARD)
+    if not forward_only:
+        set_stage_if_not_None(
+            tensor_cache,
+            num_microbatches - 1,
+            Stage.FORWARD,
+            num_microbatches - 1,
+            Stage.BACKWARD,
+        )
+    else:
+        set_stage_if_not_None(tensor_cache, num_microbatches - 1, Stage.FORWARD, 0, Stage.FORWARD)
     output_tensor = forward_step(
         forward_step_func,
         data_iterator,
@@ -435,10 +453,11 @@ def forward_backward_no_pipelining(
         config,
         collect_non_loss_data,
     )
+    wait_current_stage_if_not_None(tensor_cache)
 
     if not forward_only:
         set_stage_if_not_None(
-            tensor_cache, num_microbatches - 1, Stage.BACKWARD
+            tensor_cache, num_microbatches - 1, Stage.BACKWARD, 0, Stage.FORWARD
         )
         backward_step(
             input_tensor,
@@ -448,6 +467,7 @@ def forward_backward_no_pipelining(
             config,
             model,
         )
+        wait_current_stage_if_not_None(tensor_cache)
 
     return forward_data_store
 
