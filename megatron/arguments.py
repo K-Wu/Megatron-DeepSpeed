@@ -135,8 +135,9 @@ def validate_args(args, defaults={}):
     # del args.checkpoint_activations
 
     if args.recompute_activations:
-        args.recompute_granularity = 'selective'
-    del args.recompute_activations
+        raise RuntimeError('As we added checkpointing MLP as an option, --recompute-activations is no longer valid to reduce confusion in the options. Use instead "--recompute_granularity=selective" or "--recompute_granularity=selective_both" or "--recompute_granularity=full"')
+        # args.recompute_granularity = 'selective'
+    # del args.recompute_activations
 
     # Set input defaults.
     for key in defaults:
@@ -368,7 +369,7 @@ def validate_args(args, defaults={}):
     assert not (args.fp8_e4m3 and args.fp8_hybrid), \
         'cannot train with both fp8 e4m3 and hybrid formatting'
 
-    if args.recompute_granularity == 'selective':
+    if args.recompute_granularity in ['selective', 'selective_mlp_only', 'selective_both']:
         assert args.recompute_method is None, \
             'recompute method is not yet supported for ' \
             'selective recomputing granularity'
@@ -810,13 +811,17 @@ def _add_training_args(parser):
                        help='recompute activation to allow for training '
                        'with larger models, sequences, and batch sizes.')
     group.add_argument('--recompute-granularity', type=str, default=None,
-                       choices=['full', 'selective'],
+                       choices=['full', 'selective', 'selective_mlp_only', 'selective_both'],
                        help='Checkpoint activations to allow for training '
                        'with larger models, sequences, and batch sizes. '
                        'It is supported at two granularities 1) full: '
                        'whole transformer layer is recomputed, '
                        '2) selective: core attention part of the transformer '
-                       'layer is recomputed.')
+                       'layer is recomputed.'
+                       '3) selective_mlp_only: the MLP part of the transformer '
+                       'layer is recomputed.'
+                       '4) selective_both: both the core attention and the MLP part '
+                       'of the transformer are recomputed.')
     group.add_argument('--distribute-saved-activations',
                        action='store_true',
                        help='If set, distribute recomputed activations '

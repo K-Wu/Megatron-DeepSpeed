@@ -63,7 +63,9 @@ class MLP(MegatronModule):
             skip_bias_add=True,
         )
 
-    def forward(self, hidden_states):
+        self.checkpoint_mlp = (self.config.recompute_granularity in ['selective_mlp_only', 'selective_both'])
+
+    def _forward(self, hidden_states):
 
         # [s, b, 4 * h/p]
         intermediate_parallel, bias_parallel = self.linear_fc1(hidden_states)
@@ -80,3 +82,20 @@ class MLP(MegatronModule):
         # [s, b, h]
         output, output_bias = self.linear_fc2(intermediate_parallel)
         return output, output_bias
+
+    def forward(self, hidden_states):
+        if self.checkpoint_mlp:
+            def _custom_function(hidden_states):
+                """torch activation checkpointing cannot handle case where an output and gradients are both None. We use this function to handle this case."""
+                output, output_bias = self._forward(hidden_states)
+                if output_bias is not None:
+                    return output, output_bias
+                else:
+                    return output
+            results =  tensor_parallel.checkpoint(_custom_function, False, hidden_states)
+            if isinstance(results, tuple) and len(results) == 2:
+                return results
+            else:
+                return results, None
+        else:
+            return self._forward(hidden_states)

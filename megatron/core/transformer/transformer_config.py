@@ -83,7 +83,10 @@ class TransformerConfig(ModelParallelConfig):
                                      are also less compute intensive which makes activation checkpointing more efficient
                                      for LLMs (20B+).  See Reducing Activation Recomputation in Large Transformer
                                      Models: https://arxiv.org/abs/2205.05198 for more details.  'full' will checkpoint
-                                     the entire transformer layer.  Must be 'selective' or 'full'. Defaults to None.
+                                     the entire transformer layer.  'selective_mlp_only' will checkpoint only the MLP
+                                     portion of the transformer layer.  'selective_both' will checkpoint both the MLP
+                                     and the attention portion of the transformer layer. Must be 'selective' or 'full' 
+                                     or 'selective_mlp_only' or 'selective_both'. Defaults to None.
 
         recompute_method (str): uniform will uniformly divide the total number of transformer layers in a transformer
                                 block and recompute the input activation of each divided chunk at the specified
@@ -166,7 +169,7 @@ class TransformerConfig(ModelParallelConfig):
             self.attention_softmax_in_fp32 = True
 
         if self.recompute_granularity is not None:
-            if not self.recompute_granularity in ['full', 'selective']:
+            if not self.recompute_granularity in ['full', 'selective', 'selective_both', 'selective_mlp_only']:
                 raise ValueError(
                     f'When using recompute_granuarlity: {self.recompute_granularity} must be "full" or "selective".'
                 )
@@ -174,7 +177,7 @@ class TransformerConfig(ModelParallelConfig):
             if self.recompute_method is not None:
                 if not self.recompute_method in ['block', 'uniform']:
                     raise ValueError(f'recompute_method: {self.recompute_method} must be "block" or "uniform".')
-            elif self.recompute_granularity != 'selective':
+            elif self.recompute_granularity == 'full':
                 raise ValueError(
                     f'Using recompute_granularity: {self.recompute_granularity} so recompute_method must be "block" or "uniform"'
                 )

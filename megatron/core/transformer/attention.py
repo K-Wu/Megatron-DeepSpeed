@@ -47,7 +47,7 @@ class Attention(MegatronModule, ABC):
             attn_mask_type=self.attn_mask_type
         )
 
-        self.checkpoint_core_attention = self.config.recompute_granularity == 'selective'
+        self.checkpoint_core_attention = (self.config.recompute_granularity in ['selective', 'selective_both'])
 
         # Output.
         self.linear_proj = TERowParallelLinear(
