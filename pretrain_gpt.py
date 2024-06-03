@@ -28,6 +28,32 @@ from torch import nn
 import torch.nn.functional as F
 
 
+
+class GPTLoss(nn.Module):
+    def forward(self, loss_mask, moe_loss, mos_loss, output_tensor):
+        args = get_args()
+        losses = output_tensor.float()
+        loss_mask = loss_mask.view(-1).float()
+        loss = torch.sum(losses.view(-1) * loss_mask) / loss_mask.sum()
+
+        # Reduce loss for logging.
+        averaged_loss = average_losses_across_data_parallel_group([loss])
+        if args.mos or args.kd:
+            # assert max(args.num_experts) >= 1
+            loss = loss + moe_loss + mos_loss
+            if args.mos:
+                return loss, {'total loss': loss, 'lm loss': averaged_loss[0], 'moe loss': moe_loss, 'mos loss': mos_loss}
+            elif args.kd:
+                return loss, {'total loss': loss, 'lm loss': averaged_loss[0], 'moe loss': moe_loss, 'kd loss': mos_loss}
+            print_rank_0('>>> total loss: {}, lm loss {}, kd loss {}'.format(loss, averaged_loss[0], mos_loss))
+        else:
+            if max(args.num_experts) <= 1:
+                return loss, {'lm loss': averaged_loss[0]}
+            else:
+                loss = loss + moe_loss
+                return loss, {'lm loss': averaged_loss[0], 'moe loss': moe_loss}
+
+
 def model_provider(pre_process=True, post_process=True):
     """Build the model."""
 
@@ -86,6 +112,7 @@ def model_provider(pre_process=True, post_process=True):
                 pre_process=pre_process,
                 post_process=post_process
             )
+    model.megatron_loss_func = GPTLoss()
     see_memory_usage(f"After Building Model", force=True)
     return model
 
@@ -205,29 +232,6 @@ def get_batch_pipe(data):
     return (tokens, position_ids, attention_mask), (labels, loss_mask)
 
 
-def loss_func(loss_mask, moe_loss, mos_loss, output_tensor):
-    args = get_args()
-    losses = output_tensor.float()
-    loss_mask = loss_mask.view(-1).float()
-    loss = torch.sum(losses.view(-1) * loss_mask) / loss_mask.sum()
-
-    # Reduce loss for logging.
-    averaged_loss = average_losses_across_data_parallel_group([loss])
-    if args.mos or args.kd:
-        # assert max(args.num_experts) >= 1
-        loss = loss + moe_loss + mos_loss
-        if args.mos:
-            return loss, {'total loss': loss, 'lm loss': averaged_loss[0], 'moe loss': moe_loss, 'mos loss': mos_loss}
-        elif args.kd:
-            return loss, {'total loss': loss, 'lm loss': averaged_loss[0], 'moe loss': moe_loss, 'kd loss': mos_loss}
-        print_rank_0('>>> total loss: {}, lm loss {}, kd loss {}'.format(loss, averaged_loss[0], mos_loss))
-    else:
-        if max(args.num_experts) <= 1:
-            return loss, {'lm loss': averaged_loss[0]}
-        else:
-            loss = loss + moe_loss
-            return loss, {'lm loss': averaged_loss[0], 'moe loss': moe_loss}
-
 def calculate_mos_loss(args, stu_output, teacher_model, tokens, position_ids, attention_mask):
     mos_loss = 0
     alpha = args.kd_alpha_ce
@@ -298,7 +302,7 @@ def forward_step(data_iterator, model):
                 args.teacher_model[0], tokens, position_ids, attention_mask)
 
     # Output_tensor stores the standard loss, loos_func calculates the total loss.
-    return output_tensor, partial(loss_func, loss_mask, moe_loss, mos_loss)
+    return output_tensor, partial(model.module.module.megatron_loss_func, loss_mask, moe_loss, mos_loss)
 
 
 def train_valid_test_datasets_provider(train_val_test_num_samples):

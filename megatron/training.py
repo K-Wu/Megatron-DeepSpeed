@@ -62,8 +62,10 @@ from deepspeed import comm as dist
 
 
 from flashtrain.tensor_cache import pipeline_tensor_cache as PTC
+from flashtrain.tensor_cache.dummy_hooks import dummy_forward_hook, dummy_full_backward_hook, dummy_full_backward_pre_hook, dummy_forward_pre_hook
 import logging
 from flashtrain.tensor_cache import adapters
+from flashtrain.tensor_cache.configs import configs
 from flashtrain.logger import logger
 from flashtrain.utils import (
     register_forward_hook_recursively,
@@ -73,6 +75,8 @@ from flashtrain.utils import (
     get_sequence_of_layers,
     register_transpose_of_linear_weights,
 )
+# from cProfile import Profile
+# from pstats import SortKey, Stats
 
 try:
     import wandb
@@ -219,11 +223,13 @@ def pretrain(
     )
 
     # Set up pipeline tensor cache
-    # logger.setLevel(logging.getLevelName("INFO"))  # "WARNING"))
+    # logger.setLevel(logging.getLevelName("ERROR"))
+    logger.setLevel(logging.getLevelName("INFO"))
+
     if args.enable_tensor_cache:
         tensor_cache = PTC.PipelineTensorCache(
-            enable_activation_context_recording=True,
-            adapter=adapters.TorchMainMemoryIOAdapter(),
+            # enable_activation_context_recording=True,
+            adapter=adapters.TorchMainMemoryIOAdapter(),# configs.get_adapter(),
             implicit_wait_and_set_in_backward=True,
             num_microbatches=get_num_microbatches(),
         )
@@ -264,6 +270,7 @@ def pretrain(
 
         pipe_schedule: deepspeed.runtime.pipe.schedule.PipeSchedule
         # For each step in the schedule
+        #with Profile() as profile:
         for idx_step, step_cmds in enumerate(pipe_schedule):
             # For each instruction in the step
             for idx_cmd, cmd in enumerate(step_cmds):
@@ -317,7 +324,10 @@ def pretrain(
                 ) or isinstance(
                     cmd, deepspeed.runtime.pipe.schedule.BackwardPass
                 ):
-                    tensor_cache.wait_current_stage()
+                    tensor_cache.wait_current_stage()        
+        # if torch.distributed.get_rank() == 0:
+        #     Stats(profile.print_stats(sort=SortKey.CUMULATIVE))
+            
 
     if args.enable_tensor_cache:
         deepspeed.runtime.pipe.engine.PipelineEngine._exec_schedule = (
@@ -332,12 +342,12 @@ def pretrain(
         forward_hook = tensor_cache.get_forward_hook()
         full_backward_hook = tensor_cache.get_full_backward_hook()
         full_backward_pre_hook = tensor_cache.get_full_backward_pre_hook()
-        pack_hook = tensor_cache.get_pack_hook()
-        unpack_hook = tensor_cache.get_unpack_hook()
         torch.nn.modules.module.register_module_forward_pre_hook(
             forward_pre_hook
         )
-        torch.nn.modules.module.register_module_forward_hook(forward_hook)
+        torch.nn.modules.module.register_module_forward_hook(
+            forward_hook
+            )
         torch.nn.modules.module.register_module_full_backward_pre_hook(
             full_backward_pre_hook
         )
@@ -968,8 +978,14 @@ def train_step(
         skipped_iter = 0
         num_zeros_in_grad = 0
         assert isinstance(model[0], deepspeed.PipelineEngine)
-        loss = model[0].train_batch(data_iter=data_iterator)
-        additional_losses = model[0].get_additional_losses()
+        with torch.autograd.graph.saved_tensors_hooks(
+            tensor_cache.get_pack_hook(),
+            tensor_cache.get_unpack_hook(),
+            # TC.dummy_hooks.dummy_pack_hook,
+            # TC.dummy_hooks.dummy_unpack_hook,
+        ):
+            loss = model[0].train_batch(data_iter=data_iterator)
+            additional_losses = model[0].get_additional_losses()
         loss_key = (
             "lm loss" if additional_losses is None else "loss"
         )  # use "lm loss" for backward compatibility
@@ -1004,18 +1020,24 @@ def train_step(
     if args.timing_log_level < 2:
         config.timers = None
 
-    losses_reduced = forward_backward_func(
-        forward_step_func=forward_step_func,
-        data_iterator=data_iterator,
-        model=model,
-        num_microbatches=get_num_microbatches(),
-        seq_length=args.seq_length,
-        micro_batch_size=args.micro_batch_size,
-        decoder_seq_length=args.decoder_seq_length,
-        forward_only=False,
-        # Pass in tensor cache
-        tensor_cache=tensor_cache,
-    )
+    with torch.autograd.graph.saved_tensors_hooks(
+        tensor_cache.get_pack_hook(),
+        tensor_cache.get_unpack_hook(),
+        # TC.dummy_hooks.dummy_pack_hook,
+        # TC.dummy_hooks.dummy_unpack_hook,
+    ):
+        losses_reduced = forward_backward_func(
+            forward_step_func=forward_step_func,
+            data_iterator=data_iterator,
+            model=model,
+            num_microbatches=get_num_microbatches(),
+            seq_length=args.seq_length,
+            micro_batch_size=args.micro_batch_size,
+            decoder_seq_length=args.decoder_seq_length,
+            forward_only=False,
+            # Pass in tensor cache
+            tensor_cache=tensor_cache,
+        )
 
     # reset timers if necessary
     if config.timers is None:

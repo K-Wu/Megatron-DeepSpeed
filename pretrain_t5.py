@@ -52,6 +52,18 @@ to accumulate the encoder_hidden_state gradient across skip connections
 """
 
 
+class T5Loss(torch.nn.Module):
+    def forward(self, loss_mask, output_tensor):
+        lm_loss_ = output_tensor.float()
+        lm_loss = (
+            torch.sum(lm_loss_.view(-1) * loss_mask.reshape(-1)) / loss_mask.sum()
+        )
+
+        loss = lm_loss
+        averaged_losses = average_losses_across_data_parallel_group([lm_loss])
+
+        return loss, {"lm loss": averaged_losses[0]}
+
 def model_provider(
     pre_process=True, post_process=True, add_encoder=True, add_decoder=True
 ):
@@ -68,6 +80,7 @@ def model_provider(
         add_encoder=add_encoder,
         add_decoder=add_decoder,
     )
+    model.megatron_loss_func = T5Loss()
     return model
 
 
@@ -113,18 +126,6 @@ def get_batch(data_iterator):
     )
 
 
-def loss_func(loss_mask, output_tensor):
-    lm_loss_ = output_tensor.float()
-    lm_loss = (
-        torch.sum(lm_loss_.view(-1) * loss_mask.reshape(-1)) / loss_mask.sum()
-    )
-
-    loss = lm_loss
-    averaged_losses = average_losses_across_data_parallel_group([lm_loss])
-
-    return loss, {"lm loss": averaged_losses[0]}
-
-
 def forward_step(data_iterator, model):
     """Forward step."""
     args = get_args()
@@ -156,7 +157,7 @@ def forward_step(data_iterator, model):
     # KWU: Added this line to handle the case where output_tensor is a tuple
     if isinstance(output_tensor, tuple):
         output_tensor = output_tensor[0]
-    return output_tensor, partial(loss_func, loss_mask)
+    return output_tensor, partial(model.module.module.megatron_loss_func, loss_mask)
 
 
 def train_valid_test_datasets_provider(train_val_test_num_samples):

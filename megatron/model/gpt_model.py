@@ -309,6 +309,20 @@ def CrossEntropy(output, labels):
     loss = torch.sum(losses.view(-1) * loss_mask) / loss_mask.sum()
     return loss
 
+class GPTModelPipeLoss(torch.nn.Module):
+    def __init__(self, parent: "GPTModelPipe"):
+        super().__init__()
+        # This is to avoid circular reference causing infinite loop when PyTorch autograd recursively go through the children of each module 
+        self.circular_avoidance_dict = dict()
+        self.circular_avoidance_dict["parent"] = parent
+
+    def forward(self, output, labels):
+        loss = CrossEntropy(output, labels)
+        self.last_lm_loss = loss.clone().detach()
+        if self.circular_avoidance_dict["parent"].moe_loss is not None:
+            loss += self.circular_avoidance_dict["parent"].moe_loss
+            self.last_moe_loss = self.circular_avoidance_dict["parent"].moe_loss.clone().detach()
+        return loss
 
 class GPTModelPipe(PipelineModule,MegatronModule):
     """GPT-2 Language model."""
@@ -443,12 +457,13 @@ class GPTModelPipe(PipelineModule,MegatronModule):
         topo = PipeModelDataParallelTopology(num_pp=mpu.get_pipeline_model_parallel_world_size(),
                                              num_mp=mpu.get_tensor_model_parallel_world_size(),
                                              num_dp=mpu.get_data_parallel_world_size())
-
         super().__init__(layers=self.specs,
                          loss_fn=self.loss_func,
                          topology=topo,
                          activation_checkpoint_interval=interval,
                          partition_method='type:transformer')
+        
+        self.loss_func_module = GPTModelPipeLoss(parent = self)
 
     def _calculate_moe_loss(self, inputs):
         """ Calculate MoE auxiliary loss """
@@ -459,12 +474,16 @@ class GPTModelPipe(PipelineModule,MegatronModule):
         return hidden
 
     def loss_func(self, output, labels):
-        loss = CrossEntropy(output, labels)
-        self.last_lm_loss = loss.clone().detach()
-        if self.moe_loss is not None:
-            loss += self.moe_loss
-            self.last_moe_loss = self.moe_loss.clone().detach()
-        return loss
+        # This function is added because GPTModelPipelLoss has to be assigned after the initialization
+        return self.loss_func_module(output, labels)
+
+    # def loss_func(self, output, labels):
+    #     loss = CrossEntropy(output, labels)
+    #     self.last_lm_loss = loss.clone().detach()
+    #     if self.moe_loss is not None:
+    #         loss += self.moe_loss
+    #         self.last_moe_loss = self.moe_loss.clone().detach()
+    #     return loss
 
     def universal_checkpoint_info(self):
         return UniversalCheckpointInfo(using_model_pipe=True).get()
