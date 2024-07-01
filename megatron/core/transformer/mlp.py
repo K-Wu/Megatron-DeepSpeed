@@ -64,20 +64,30 @@ class MLP(MegatronModule):
         )
 
         self.checkpoint_mlp = (self.config.recompute_granularity in ['selective_mlp_only', 'selective_both'])
+        self.recompute_non_linear_layer_in_mlp = config.recompute_non_linear_layer_in_mlp
 
     def _forward(self, hidden_states):
 
         # [s, b, 4 * h/p]
         intermediate_parallel, bias_parallel = self.linear_fc1(hidden_states)
 
-        if self.config.bias_gelu_fusion:
-            assert self.config.add_bias_linear is True
-            assert self.activation_func == F.gelu
-            intermediate_parallel = bias_gelu_impl(intermediate_parallel, bias_parallel)
+        
+        # Reduce excessive tensor offloading
+        def _apply_non_linear(intermediate_parallel, bias_parallel):
+            if self.config.bias_gelu_fusion:
+                assert self.config.add_bias_linear is True
+                assert self.activation_func == F.gelu
+                intermediate_parallel = bias_gelu_impl(intermediate_parallel, bias_parallel)
+            else:
+                if bias_parallel is not None:
+                    intermediate_parallel = intermediate_parallel + bias_parallel
+                intermediate_parallel = self.activation_func(intermediate_parallel)
+            return intermediate_parallel
+        
+        if self.recompute_non_linear_layer_in_mlp:
+            intermediate_parallel = tensor_parallel.checkpoint(_apply_non_linear, False, intermediate_parallel, bias_parallel)
         else:
-            if bias_parallel is not None:
-                intermediate_parallel = intermediate_parallel + bias_parallel
-            intermediate_parallel = self.activation_func(intermediate_parallel)
+            intermediate_parallel = _apply_non_linear(intermediate_parallel, bias_parallel)
 
         # [s, b, h]
         output, output_bias = self.linear_fc2(intermediate_parallel)

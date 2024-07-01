@@ -153,21 +153,30 @@ class ParallelMLP(MegatronModule):
         )
 
         self.checkpoint_mlp = (config.recompute_granularity in ['selective_mlp_only', 'selective_both'])
+        self.recompute_non_linear_layer_in_mlp = config.recompute_non_linear_layer_in_mlp
 
     def _forward(self, hidden_states):
 
         # [s, b, 4hp]
         intermediate_parallel, bias_parallel = self.dense_h_to_4h(hidden_states)
 
-        if self.bias_gelu_fusion:
-            assert self.add_bias is True
-            # DeepSpeed FLOPS profiler temporarily substitues functions like F.gelu to calculate the throughput
-            assert hasattr(self, "__flops__") or self.activation_func == F.gelu
-            intermediate_parallel = bias_gelu_impl(intermediate_parallel, bias_parallel)
+        # Reduce excessive tensor offloading
+        def _apply_non_linear(intermediate_parallel, bias_parallel):
+            if self.bias_gelu_fusion:
+                assert self.add_bias is True
+                # DeepSpeed FLOPS profiler temporarily substitues functions like F.gelu to calculate the throughput
+                assert hasattr(self, "__flops__") or self.activation_func == F.gelu
+                intermediate_parallel = bias_gelu_impl(intermediate_parallel, bias_parallel)
+            else:
+                if bias_parallel is not None:
+                    intermediate_parallel = intermediate_parallel + bias_parallel
+                intermediate_parallel = self.activation_func(intermediate_parallel)
+            return intermediate_parallel
+
+        if self.recompute_non_linear_layer_in_mlp:
+            intermediate_parallel = tensor_parallel.checkpoint(_apply_non_linear, False, intermediate_parallel, bias_parallel)
         else:
-            if bias_parallel is not None:
-                intermediate_parallel = intermediate_parallel + bias_parallel
-            intermediate_parallel = self.activation_func(intermediate_parallel)
+            intermediate_parallel = _apply_non_linear(intermediate_parallel, bias_parallel)
 
         # [s, b, h]
         output, output_bias = self.dense_4h_to_h(intermediate_parallel)
@@ -314,6 +323,7 @@ class CoreAttention(MegatronModule):
             (output_size[0]*output_size[1], output_size[2], output_size[3]),
             query_layer.dtype, "mpu")
 
+        # TODO: reduce excessive tensor offloading
         # Raw attention scores. [b * np, sq, sk]
         matmul_result = torch.baddbmm(
             matmul_input_buffer,
@@ -360,7 +370,7 @@ class CoreAttention(MegatronModule):
         # change view [b * np, sq, sk]
         attention_probs = attention_probs.view(output_size[0] * output_size[1],
                                                output_size[2], -1)
-
+        # TODO: reduce excessive tensor offloading
         # matmul: [b * np, sq, hn]
         context_layer = torch.bmm(attention_probs, value_layer.transpose(0, 1))
 

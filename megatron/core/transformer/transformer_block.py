@@ -36,8 +36,6 @@ class TransformerBlock(MegatronModule):
         # required for pipeline parallel schedules
         self.input_tensor = None
 
-        self.checkpoint_core_attention = (self.config.recompute_granularity in ['selective', 'selective_both'])
-
         # TODO: Maybe we can create a build_transformer_block method here instead
 
         self.num_layers_per_pipeline_rank = (

@@ -135,7 +135,7 @@ def validate_args(args, defaults={}):
     # del args.checkpoint_activations
 
     if args.recompute_activations:
-        raise RuntimeError('As we added checkpointing MLP as an option, --recompute-activations is no longer valid to reduce confusion in the options. Use instead "--recompute_granularity=selective" or "--recompute_granularity=selective_both" or "--recompute_granularity=full"')
+        raise RuntimeError('As we added checkpointing MLP as an option, --recompute-activations is no longer valid to reduce confusion in the options. Use instead "--recompute_granularity=selective" or "--recompute_granularity=selective_mlp_only" or "--recompute_granularity=selective_both" or "--recompute_granularity=full"')
         # args.recompute_granularity = 'selective'
     # del args.recompute_activations
 
@@ -822,6 +822,7 @@ def _add_training_args(parser):
                        'layer is recomputed.'
                        '4) selective_both: both the core attention and the MLP part '
                        'of the transformer are recomputed.')
+    group.add_argument('--recompute-non-linear-layer-in-mlp', action='store_true')
     group.add_argument('--distribute-saved-activations',
                        action='store_true',
                        help='If set, distribute recomputed activations '

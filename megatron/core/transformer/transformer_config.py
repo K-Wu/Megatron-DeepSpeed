@@ -143,6 +143,7 @@ class TransformerConfig(ModelParallelConfig):
 
     # activation recomputation
     recompute_granularity: str = None
+    recompute_non_linear_layer_in_mlp: bool = False
     recompute_method: str = None
     recompute_num_layers: int = None
     distribute_saved_activations: bool = None
