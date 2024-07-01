@@ -61,12 +61,13 @@ from megatron.model.transformer import ParallelTransformerLayer
 from deepspeed import comm as dist
 
 
-from flashtrain.tensor_cache import pipeline_tensor_cache as PTC
-from flashtrain.tensor_cache.dummy_hooks import dummy_forward_hook, dummy_full_backward_hook, dummy_full_backward_pre_hook, dummy_forward_pre_hook
 import logging
+from flashtrain.tensor_cache import pipeline_tensor_cache as PTC
+from flashtrain.tensor_cache import tensor_cache as TC
+from flashtrain.tensor_cache.dummy_hooks import dummy_forward_hook, dummy_full_backward_hook, dummy_full_backward_pre_hook, dummy_forward_pre_hook
 from flashtrain.tensor_cache import adapters
 from flashtrain.tensor_cache.configs import configs
-from flashtrain.logger import logger
+from flashtrain.logger import logger, get_oneline_str
 from flashtrain.utils import (
     register_forward_hook_recursively,
     register_full_backward_hook_recursively,
@@ -75,6 +76,7 @@ from flashtrain.utils import (
     get_sequence_of_layers,
     register_transpose_of_linear_weights,
 )
+import contextlib
 # from cProfile import Profile
 # from pstats import SortKey, Stats
 
@@ -84,6 +86,7 @@ except (ImportError, ModuleNotFoundError):
     wandb = None
 
 from types import MethodType
+from typing import Optional
 
 
 def print_datetime(string):
@@ -161,6 +164,15 @@ def pretrain(
         group.add_argument(
             "--enable-tensor-cache", action="store_true", default=False
         )
+        group.add_argument(
+            "--tensor-cache-in-memory-adapter", action="store_true", default=False
+        )
+        group.add_argument(
+            "--tensor-cache-log-level", type=str, default="ERROR", choices=["CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG", "NOTSET"]
+        )
+        group.add_argument(
+            "--profile-first-iter", action="store_true", default=False
+        )
         return parser
 
     # Initalize and get arguments, timers, and Tensorboard writer.
@@ -223,13 +235,23 @@ def pretrain(
     )
 
     # Set up pipeline tensor cache
-    # logger.setLevel(logging.getLevelName("ERROR"))
-    logger.setLevel(logging.getLevelName("INFO"))
-
+    if torch.distributed.get_rank() == 0:
+        # logger.setLevel(logging.getLevelName("CRITICAL"))
+        # logger.setLevel(logging.getLevelName("ERROR"))
+        # logger.setLevel(logging.getLevelName("INFO"))
+        logger.setLevel(logging.getLevelName(args.tensor_cache_log_level))
+    else:
+        # logger.setLevel(logging.getLevelName("CRITICAL"))
+        logging.disable()
     if args.enable_tensor_cache:
+        if args.tensor_cache_in_memory_adapter:
+            adapter = adapters.TorchMainMemoryIOAdapter()
+        else:
+            # adapter=adapters.TorchDummyIOAdapter(), 
+            adapter=configs.get_adapter()
         tensor_cache = PTC.PipelineTensorCache(
             # enable_activation_context_recording=True,
-            adapter=adapters.TorchMainMemoryIOAdapter(),# configs.get_adapter(),
+            adapter=adapter, 
             implicit_wait_and_set_in_backward=True,
             num_microbatches=get_num_microbatches(),
         )
@@ -334,8 +356,10 @@ def pretrain(
             deepspeed_monkey_patched_PipelineEngine_exec_schedule
         )
 
-        for tc_ in tensor_cache.tensor_caches:
+        for idx_tc_, tc_ in enumerate(tensor_cache.tensor_caches):
             for model_module in model:
+                if idx_tc_ == 0:
+                    logger.error(get_oneline_str("names of parameters", [n for n,p in model_module.named_parameters()]))
                 tc_.add_parameters_from_module(model_module)
                 register_transpose_of_linear_weights(model_module, tc_)
         forward_pre_hook = tensor_cache.get_forward_pre_hook()
@@ -978,12 +1002,19 @@ def train_step(
         skipped_iter = 0
         num_zeros_in_grad = 0
         assert isinstance(model[0], deepspeed.PipelineEngine)
-        with torch.autograd.graph.saved_tensors_hooks(
-            tensor_cache.get_pack_hook(),
-            tensor_cache.get_unpack_hook(),
-            # TC.dummy_hooks.dummy_pack_hook,
-            # TC.dummy_hooks.dummy_unpack_hook,
-        ):
+
+        if tensor_cache is None:
+            cm = contextlib.nullcontext()
+        else:
+            cm = torch.autograd.graph.saved_tensors_hooks(
+                tensor_cache.get_pack_hook(),
+                tensor_cache.get_unpack_hook(),
+                # TC.dummy_hooks.dummy_pack_hook,
+                # TC.dummy_hooks.dummy_unpack_hook,
+            )
+            # cm = contextlib.nullcontext()
+
+        with cm:
             loss = model[0].train_batch(data_iter=data_iterator)
             additional_losses = model[0].get_additional_losses()
         loss_key = (
@@ -1020,12 +1051,18 @@ def train_step(
     if args.timing_log_level < 2:
         config.timers = None
 
-    with torch.autograd.graph.saved_tensors_hooks(
-        tensor_cache.get_pack_hook(),
-        tensor_cache.get_unpack_hook(),
-        # TC.dummy_hooks.dummy_pack_hook,
-        # TC.dummy_hooks.dummy_unpack_hook,
-    ):
+    if tensor_cache is None:
+        cm = contextlib.nullcontext()
+    else:
+        cm = torch.autograd.graph.saved_tensors_hooks(
+            tensor_cache.get_pack_hook(),
+            tensor_cache.get_unpack_hook(),
+            # TC.dummy_hooks.dummy_pack_hook,
+            # TC.dummy_hooks.dummy_unpack_hook,
+        )
+        # cm = contextlib.nullcontext()
+
+    with cm:
         losses_reduced = forward_backward_func(
             forward_step_func=forward_step_func,
             data_iterator=data_iterator,
@@ -1671,7 +1708,8 @@ def training_log(
                     elapsed_time_per_iteration,
                     args.consumed_train_tokens,
                 )
-        log_string = " iteration {:8d}/{:8d} |".format(
+        log_string = f"[{args.log_interval} step average] "
+        log_string += " iteration {:8d}/{:8d} |".format(
             iteration, args.train_iters
         )
         log_string += " consumed samples: {:12d} |".format(
@@ -1746,7 +1784,7 @@ def training_log(
         total_loss_dict[advanced_iters_key] = 0
         total_loss_dict[skipped_iters_key] = 0
         total_loss_dict[nan_iters_key] = 0
-        print_rank_last(log_string)
+        print_rank_last(log_string) 
         if report_memory_flag and learning_rate > 0.0:
             # Report memory after optimizer state has been initialized.
             report_memory("(after {} iterations)".format(iteration))
@@ -1777,7 +1815,7 @@ def train(
     train_data_iterator,
     valid_data_iterator,
     process_non_loss_data_func,
-    tensor_cache,
+    tensor_cache: Optional[TC.TensorCache] = None,
 ):
     """Train the model function."""
     args = get_args()
@@ -1821,6 +1859,21 @@ def train(
         args.train_tokens is None
         or args.consumed_train_tokens < args.train_tokens
     ):
+        # Instantiate the host_pinned_memory_allocator if it is a tracker and has tracked the peak memory
+        if iteration == 1 and args.enable_tensor_cache and args.tensor_cache_in_memory_adapter:
+            if isinstance(tensor_cache, PTC.PipelineTensorCache):
+                tensor_caches = tensor_cache.tensor_caches
+            else:
+                tensor_caches = [tensor_cache]
+            # TODO: for now, we only instantiate the adpater of the first tensor cache because we assume all tensor caches use the same adapter. We need to assert it is true in the future.
+            tc_ = tensor_caches[0]
+            # TODO: add instantiate_host_pinned_memory_allocator() as a function of OffloadEngineBase, i.e., add support in ProcessOffloadEngine as well
+            if isinstance(tc_.offloader.engine.adapter, adapters.RevolverIOAdapter):
+                for ad_ in tc_.offloader.engine.adapter.adapters:
+                    ad_.instantiate_host_pinned_memory_allocator()
+            else:
+                tc_.offloader.engine.adapter.instantiate_host_pinned_memory_allocator()
+
         update_num_microbatches(args.consumed_train_samples)
         if args.deepspeed:
             # inform deepspeed of any batch size changes

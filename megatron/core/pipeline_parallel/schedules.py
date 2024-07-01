@@ -26,9 +26,6 @@ from flashtrain.tensor_cache.pipeline_tensor_cache import (
     PipelineTensorCache,
     Stage,
 )
-#from cProfile import Profile
-#from pstats import SortKey, Stats
-# from pyinstrument import Profiler
 
 # Types
 Shape = Union[List[int], torch.Size]
@@ -395,11 +392,15 @@ def forward_backward_no_pipelining(
     if no_sync_func is None:
         no_sync_func = contextlib.nullcontext
 
-    # profiler = Profiler()
-    # profiler.start()
 
 
     args = get_args()
+    if args.profile_first_iter:        
+        #from cProfile import Profile
+        #from pstats import SortKey, Stats
+        from pyinstrument import Profiler
+        profiler = Profiler(interval=0.001)
+        profiler.start()
     if args.deepspeed:
         model.set_gradient_accumulation_boundary(False)
 
@@ -477,10 +478,11 @@ def forward_backward_no_pipelining(
         )
         wait_current_stage_if_not_None(tensor_cache)
 
-    # profiler.stop()
-    # if torch.distributed.get_rank() == 0:
-    #     profiler.print()
-    # exit(0)
+    if args.profile_first_iter:
+        profiler.stop()
+        if torch.distributed.get_rank() == 0:
+            profiler.print()
+        exit(0)
 
     return forward_data_store
 
