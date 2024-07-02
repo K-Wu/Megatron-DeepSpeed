@@ -1859,6 +1859,8 @@ def train(
         args.train_tokens is None
         or args.consumed_train_tokens < args.train_tokens
     ):
+        if args.profile_first_iter and iteration >=2:        
+            exit(0)
         # Instantiate the host_pinned_memory_allocator if it is a tracker and has tracked the peak memory
         if iteration == 1 and args.enable_tensor_cache and args.tensor_cache_in_memory_adapter:
             if isinstance(tensor_cache, PTC.PipelineTensorCache):
@@ -1873,6 +1875,22 @@ def train(
                     ad_.instantiate_host_pinned_memory_allocator()
             else:
                 tc_.offloader.engine.adapter.instantiate_host_pinned_memory_allocator()
+        elif iteration > 1:
+            # Clear the states of the memory allocator
+            if args.enable_tensor_cache and args.tensor_cache_in_memory_adapter:
+                # TODO: fix the allocator so that after the backward propagation, no tensors are left in the memory allocator
+                if isinstance(tensor_cache, PTC.PipelineTensorCache):
+                    tensor_caches = tensor_cache.tensor_caches
+                else:
+                    tensor_caches = [tensor_cache]
+                # TODO: for now, we only instantiate the adpater of the first tensor cache because we assume all tensor caches use the same adapter. We need to assert it is true in the future.
+                tc_ = tensor_caches[0]
+                # TODO: add instantiate_host_pinned_memory_allocator() as a function of OffloadEngineBase, i.e., add support in ProcessOffloadEngine as well
+                if isinstance(tc_.offloader.engine.adapter, adapters.RevolverIOAdapter):
+                    for ad_ in tc_.offloader.engine.adapter.adapters:
+                        ad_.host_pinned_memory_allocator.init_states()
+                else:
+                    tc_.offloader.engine.adapter.host_pinned_memory_allocator.init_states()
 
         update_num_microbatches(args.consumed_train_samples)
         if args.deepspeed:

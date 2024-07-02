@@ -482,7 +482,6 @@ def forward_backward_no_pipelining(
         profiler.stop()
         if torch.distributed.get_rank() == 0:
             profiler.print()
-        exit(0)
 
     return forward_data_store
 
