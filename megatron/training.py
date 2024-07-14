@@ -62,8 +62,10 @@ from deepspeed import comm as dist
 
 
 import logging
+from flashtrain.tensor_cache import monkey_patched_deepspeed_checkpoint
 from flashtrain.tensor_cache import pipeline_tensor_cache as PTC
 from flashtrain.tensor_cache import tensor_cache as TC
+from flashtrain.tensor_cache import set_tensor_cache
 from flashtrain.tensor_cache.dummy_hooks import dummy_forward_hook, dummy_full_backward_hook, dummy_full_backward_pre_hook, dummy_forward_pre_hook
 from flashtrain.tensor_cache import adapters
 from flashtrain.tensor_cache.configs import configs
@@ -255,6 +257,7 @@ def pretrain(
             implicit_wait_and_set_in_backward=True,
             num_microbatches=get_num_microbatches(),
         )
+        set_tensor_cache(tensor_cache)
     else:
         tensor_cache = None
 
@@ -350,8 +353,11 @@ def pretrain(
         # if torch.distributed.get_rank() == 0:
         #     Stats(profile.print_stats(sort=SortKey.CUMULATIVE))
             
+    # Monkey patch activation checkpoint function to trigger pack/unpack hook
+    deepspeed.runtime.activation_checkpointing.checkpointing.CheckpointFunction = monkey_patched_deepspeed_checkpoint.CheckpointFunction
 
     if args.enable_tensor_cache:
+        # Monkey patch _exec_schedule of PipelineEngine to incorporate tensor cache
         deepspeed.runtime.pipe.engine.PipelineEngine._exec_schedule = (
             deepspeed_monkey_patched_PipelineEngine_exec_schedule
         )
@@ -371,7 +377,7 @@ def pretrain(
         )
         torch.nn.modules.module.register_module_forward_hook(
             forward_hook
-            )
+        )
         torch.nn.modules.module.register_module_full_backward_pre_hook(
             full_backward_pre_hook
         )
