@@ -254,7 +254,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
     def build_model_and_main_param_groups(cls,
                                           model_gbuf_ranges,
                                           param_gbuf_map,
-                                          opt_group_ranges):
+                                          opt_group_ranges, use_pure_low_precision):
         """
         Create main parameter groups needed for the optimizer step.
 
@@ -303,8 +303,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 param_range = gbuf_range["param_map"][model_param]["param"]
 
                 # fp16, bf16 params.
-                if model_param.type() in ['torch.cuda.HalfTensor',
-                                          'torch.cuda.BFloat16Tensor']:
+                if (model_param.type() in ['torch.cuda.HalfTensor',
+                                          'torch.cuda.BFloat16Tensor']) and (not use_pure_low_precision):
 
                     # Clone model -> main.
                     shard_model_param = model_param.detach().view(-1) \
@@ -324,7 +324,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     shard_fp32_from_float16_params_this_group.append(shard_main_param)
 
                 # fp32 params.
-                elif model_param.type() == 'torch.cuda.FloatTensor':
+                elif model_param.type() == 'torch.cuda.FloatTensor' or (model_param.type() in ['torch.cuda.HalfTensor',
+                                          'torch.cuda.BFloat16Tensor'] and use_pure_low_precision):
                     shard_model_param = model_param.view(-1) \
                         [param_range.start:param_range.end]
                     model_fp32_params_this_group.append(model_param)
@@ -358,7 +359,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
     def __init__(self, optimizer, clip_grad, log_num_zeros_in_grad,
                  params_have_main_grad, use_contiguous_buffers_in_local_ddp,
-                 fp16, bf16, params_dtype, grad_scaler, models):
+                 fp16, bf16, params_dtype, grad_scaler, models, use_pure_low_precision=False):
         """
         See top of class definition for argument descriptions.
 
@@ -373,6 +374,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             optimizer, clip_grad, log_num_zeros_in_grad,
             params_have_main_grad, use_contiguous_buffers_in_local_ddp,
             fp16, bf16, params_dtype, grad_scaler, models)
+        self.use_pure_low_precision = use_pure_low_precision
 
         # Verify that contiguous buffers are being used.
         # - Note: this should already be checked in arguments.py.
@@ -401,7 +403,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             self.shard_fp32_from_float16_groups,
         ) = self.build_model_and_main_param_groups(self.model_gbuf_ranges,
                                                    self.model_param_gbuf_map,
-                                                   self.opt_group_ranges)
+                                                   self.opt_group_ranges, self.use_pure_low_precision)
 
         # Initialize param buffers.
         # - These are views on the DDP model's grad buffers, that share
@@ -960,7 +962,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     model_grad = model_param.main_grad
                     shard_model_grad = model_grad.view(-1) \
                         [param_range.start:param_range.end]
-                    shard_main_param.grad = shard_model_grad.float()
+                    if self.use_pure_low_precision:
+                        shard_main_param.grad = shard_model_grad
+                    else:
+                        shard_main_param.grad = shard_model_grad.float()
 
         # Copy model groups to shard groups.
         copy_group_grads(self.model_float16_groups,

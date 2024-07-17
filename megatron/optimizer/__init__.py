@@ -65,6 +65,7 @@ def get_param_groups(modules,
 
     return param_groups
 
+
 def get_megatron_optimizer(model,
                            no_weight_decay_cond=None,
                            scale_lr_cond=None,
@@ -126,6 +127,17 @@ def get_megatron_optimizer(model,
     #   the model params and main params are distinct.
     if args.fp16 or args.bf16 or args.use_distributed_optimizer:
 
+        if (not args.use_distributed_optimizer) and args.use_pure_low_precision:
+            # as a hack, we use FP32Optimizer because the type conversion free logic is applicable to pure FP16/BF16 as well.
+            result = FP32Optimizer(optimizer, args.clip_grad,
+                                args.log_num_zeros_in_grad,
+                                params_have_main_grad,
+                                args.use_contiguous_buffers_in_local_ddp,
+                                model)
+            # Assign this attribute to skip the fp32 assertion in gradient clip call
+            result.use_pure_low_precision = True
+            return result
+
         # Grad scaler:
         #    if loss-scale is provided, instantiate the constant scaler.
         #    if we are using fp16 and loss-scale is not present, use a
@@ -153,7 +165,9 @@ def get_megatron_optimizer(model,
         opt_ty = DistributedOptimizer \
             if args.use_distributed_optimizer else \
             Float16OptimizerWithFloat16Params
-        return opt_ty(optimizer,
+        if args.use_pure_low_precision:
+            assert opt_ty == DistributedOptimizer
+            return DistributedOptimizer(optimizer,
                       args.clip_grad,
                       args.log_num_zeros_in_grad,
                       params_have_main_grad,
@@ -162,7 +176,19 @@ def get_megatron_optimizer(model,
                       args.bf16,
                       args.params_dtype,
                       grad_scaler,
-                      model)
+                      model,
+                      True)
+        else:
+            return opt_ty(optimizer,
+                        args.clip_grad,
+                        args.log_num_zeros_in_grad,
+                        params_have_main_grad,
+                        args.use_contiguous_buffers_in_local_ddp,
+                        args.fp16,
+                        args.bf16,
+                        args.params_dtype,
+                        grad_scaler,
+                        model)
 
     # FP32.
     return FP32Optimizer(optimizer, args.clip_grad,

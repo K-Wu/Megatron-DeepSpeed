@@ -1084,6 +1084,8 @@ def _add_checkpointing_args(parser):
 def _add_mixed_precision_args(parser):
     group = parser.add_argument_group(title='mixed precision')
 
+    group.add_argument('--use-pure-low-precision', action='store_true', 
+                        help = "Use purely fp16 and bf16 and eliminates all the float32 gradients and master weight copy.")
     group.add_argument('--fp16', action='store_true',
                        help='Run model in fp16 mode.')
     group.add_argument('--bf16', action='store_true',

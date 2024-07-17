@@ -139,7 +139,12 @@ def forward_step(data_iterator, model):
     output_tensor = model(tokens, padding_mask, tokentype_ids=types,
                           lm_labels=lm_labels)
 
-    return output_tensor, partial(model.module.module.megatron_loss_func, loss_mask, sentence_order)
+
+    if args.fp16 or args.bf16:
+        return output_tensor, partial(model.module.module.megatron_loss_func, loss_mask, sentence_order)
+    else:
+        # Need to use model.module instead of model.module.module for FP32 case
+        return output_tensor, partial(model.module.megatron_loss_func, loss_mask, sentence_order)
 
 
 def train_valid_test_datasets_provider(train_val_test_num_samples):

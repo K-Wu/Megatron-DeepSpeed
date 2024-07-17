@@ -7,6 +7,7 @@ import math
 import sys
 import time
 import json
+from torch.profiler import profile, record_function, ProfilerActivity
 
 # The earliest we can measure the start time.
 _TRAIN_START_TIME = time.time()
@@ -48,7 +49,7 @@ from megatron.utils import (
     update_rotary_pos_emb,
 )
 from megatron.model.vision.knn_monitor import compute_feature_bank
-from megatron.arguments import core_transformer_config_from_args
+from megatron.arguments import core_transformer_config_from_args, parse_args
 
 import deepspeed
 from deepspeed.accelerator import get_accelerator
@@ -62,6 +63,7 @@ from deepspeed import comm as dist
 
 
 import logging
+from flashtrain.utils import calculate_model_weight_size
 from flashtrain.tensor_cache import monkey_patched_deepspeed_checkpoint
 from flashtrain.tensor_cache import pipeline_tensor_cache as PTC
 from flashtrain.tensor_cache import tensor_cache as TC
@@ -78,6 +80,7 @@ from flashtrain.utils import (
     get_sequence_of_layers,
     register_transpose_of_linear_weights,
 )
+import gc
 import contextlib
 # from cProfile import Profile
 # from pstats import SortKey, Stats
@@ -175,7 +178,19 @@ def pretrain(
         group.add_argument(
             "--profile-first-iter", action="store_true", default=False
         )
+        group.add_argument(
+            "--profile-memory", action="store_true", default=False, help="Profile the first 10 training steps. Use https://pytorch.org/memory_viz to open the .pickle file generated. The dumping may take a few minutes."
+        )
+        group.add_argument(
+            "--profile-memory-beginning", action="store_true", default=False, help="Profile the megatron initialization and the first 2 training steps."
+        )
         return parser
+    
+    # Parse args here temporarily to get profile-memory-beginning
+    args = parse_args(args_provider, False)
+    if args.profile_memory_beginning:
+        torch.cuda.memory._record_memory_history(enabled='all')
+
 
     # Initalize and get arguments, timers, and Tensorboard writer.
     initialize_megatron(
@@ -252,7 +267,7 @@ def pretrain(
             # adapter=adapters.TorchDummyIOAdapter(), 
             adapter=configs.get_adapter()
         tensor_cache = PTC.PipelineTensorCache(
-            # enable_activation_context_recording=True,
+            enable_activation_context_recording=args.deepspeed_activation_checkpointing,
             adapter=adapter, 
             implicit_wait_and_set_in_backward=True,
             num_microbatches=get_num_microbatches(),
@@ -1015,10 +1030,7 @@ def train_step(
             cm = torch.autograd.graph.saved_tensors_hooks(
                 tensor_cache.get_pack_hook(),
                 tensor_cache.get_unpack_hook(),
-                # TC.dummy_hooks.dummy_pack_hook,
-                # TC.dummy_hooks.dummy_unpack_hook,
             )
-            # cm = contextlib.nullcontext()
 
         with cm:
             loss = model[0].train_batch(data_iter=data_iterator)
@@ -1042,6 +1054,11 @@ def train_step(
                 partition.zero_grad_buffer()
         optimizer.zero_grad()
 
+    # TODO: measure the 2nd iteration memory use here for (weight + copies + optimizer state)
+    # TODO: measure the 1st iteration memory use here for (optimizer state)
+    # TODO: measure optimizer state by (2nd iteration memmory use here - 1st iteration memory use)
+    # TODO: reset the memory peak at 2nd iteration
+
     # Forward pass.
     timers("forward-backward", log_level=1).start(
         barrier=args.barrier_with_L1_time
@@ -1063,10 +1080,7 @@ def train_step(
         cm = torch.autograd.graph.saved_tensors_hooks(
             tensor_cache.get_pack_hook(),
             tensor_cache.get_unpack_hook(),
-            # TC.dummy_hooks.dummy_pack_hook,
-            # TC.dummy_hooks.dummy_unpack_hook,
         )
-        # cm = contextlib.nullcontext()
 
     with cm:
         losses_reduced = forward_backward_func(
@@ -1103,6 +1117,10 @@ def train_step(
             model[0], (torchDDP, LocalDDP, Float16Module)
         )
         unwrapped_model.cancel_gradients_last_layer(args.curr_iteration)
+
+    
+    # TODO: measure the 2nd iteration memory use peak here for activation memory use peak
+    # TODO: measure the 1st iteration memory here for (weight + copies)
 
     # Update parameters.
     timers("optimizer", log_level=1).start(barrier=args.barrier_with_L1_time)
@@ -1787,6 +1805,7 @@ def training_log(
             tokens_per_gpu_per_second
         )
         log_string += " TFLOPs: {:.2f} |".format(tflops)
+        log_string += " Model size (GB): {:.2f} |".format(sum([calculate_model_weight_size(m) for m in model])/1024/1024/1024)
         total_loss_dict[advanced_iters_key] = 0
         total_loss_dict[skipped_iters_key] = 0
         total_loss_dict[nan_iters_key] = 0
@@ -1882,6 +1901,7 @@ def train(
             else:
                 tc_.offloader.engine.adapter.instantiate_host_pinned_memory_allocator()
         elif iteration > 1:
+            # TODO: set the adaptive offloaded layer number in the second iteration
             # Clear the states of the memory allocator
             if args.enable_tensor_cache and args.tensor_cache_in_memory_adapter:
                 # TODO: fix the allocator so that after the backward propagation, no tensors are left in the memory allocator
@@ -1917,6 +1937,11 @@ def train(
                     update_rotary_pos_emb(curriculum_seqlen)
             args.curriculum_seqlen = curriculum_seqlen
         args.curr_iteration = iteration
+        
+        # Start memory profiling
+        if iteration == 0 and args.profile_memory:
+            torch.cuda.memory._record_memory_history(enabled='all')
+
         loss_dict, skipped_iter, grad_norm, num_zeros_in_grad = train_step(
             forward_step_func,
             train_data_iterator,
@@ -1926,6 +1951,18 @@ def train(
             config,
             tensor_cache,
         )
+        
+        # Save a snapshot of the memory allocations
+        # Reference: https://pytorch.org/tutorials/intermediate/optimizer_step_in_backward_tutorial.html
+        if (iteration == 4 and args.profile_memory) or (iteration ==1 and args.profile_memory_beginning):
+            s = torch.cuda.memory._snapshot()
+            filename = f"snapshot_{torch.distributed.get_rank()}.pickle" if args.profile_memory else f"snapshot_beginning_{torch.distributed.get_rank()}.pickle"
+            with open(filename, "wb") as f:
+                import pickle
+                pickle.dump(s, f)
+            torch.cuda.memory._record_memory_history(enabled=None)
+            exit(0)
+
         iteration += 1
         args.iteration = iteration
         new_samples = (
@@ -2076,6 +2113,14 @@ def train(
             torch.distributed.barrier()
             print_datetime("exiting program at iteration {}".format(iteration))
             sys.exit()
+
+        # Clear up memory
+        # for m in model:
+        #     m.zero_grad(set_to_none=True)
+        # gc.collect()
+        # torch.cuda.empty_cache()
+        # if mpu.get_data_parallel_rank() == 0:
+        #     print(torch.cuda.memory_summary(), flush=True)
 
     return iteration
 

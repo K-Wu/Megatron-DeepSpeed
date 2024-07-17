@@ -117,9 +117,13 @@ class MegatronOptimizer(ABC):
     def clip_grad_norm(self, clip_grad):
         params = self.get_parameters()
         grads_for_norm = self.get_main_grads_for_grad_norm()
+        if hasattr(self, 'use_pure_low_precision') and self.use_pure_low_precision:
+            hack_for_pure_low_precision = True
+        else:
+            hack_for_pure_low_precision = False
         return clip_grad_norm_fp32(
             params, grads_for_norm, clip_grad,
-            model_parallel_group=self.get_model_parallel_group())
+            model_parallel_group=self.get_model_parallel_group(), hack_for_pure_low_precision=hack_for_pure_low_precision)
 
 
     def count_zeros(self):
@@ -695,6 +699,7 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
 
 
 class FP32Optimizer(MegatronOptimizer):
+
 
     def __init__(self, optimizer, clip_grad,
                  log_num_zeros_in_grad,

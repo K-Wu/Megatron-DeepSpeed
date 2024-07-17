@@ -19,7 +19,7 @@ from megatron.core.tensor_parallel import param_is_not_tensor_parallel_duplicate
 
 def clip_grad_norm_fp32(parameters, grads_for_norm,
                         max_norm, norm_type=2,
-                        model_parallel_group=None):
+                        model_parallel_group=None, hack_for_pure_low_precision=False):
     """Clips gradient norm of an iterable of parameters whose gradients
        are in fp32.
 
@@ -51,7 +51,8 @@ def clip_grad_norm_fp32(parameters, grads_for_norm,
     grads = []
     for param in parameters:
         if param.grad is not None:
-            assert param.grad.type() == 'torch.{}.FloatTensor'.format(get_accelerator().device_name())
+            if not hack_for_pure_low_precision:
+                assert param.grad.type() == 'torch.{}.FloatTensor'.format(get_accelerator().device_name())
             grads.append(param.grad.detach())
 
     # Norm parameters.
