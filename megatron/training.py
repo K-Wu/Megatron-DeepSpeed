@@ -67,7 +67,7 @@ from flashtrain.utils import calculate_model_weight_size
 from flashtrain.tensor_cache import monkey_patched_deepspeed_checkpoint
 from flashtrain.tensor_cache import pipeline_tensor_cache as PTC
 from flashtrain.tensor_cache import tensor_cache as TC
-from flashtrain.tensor_cache import set_tensor_cache
+from flashtrain.tensor_cache import set_tensor_cache, get_memory_use_stats_recorder,init_memory_use_stats_recorder
 from flashtrain.tensor_cache.dummy_hooks import dummy_forward_hook, dummy_full_backward_hook, dummy_full_backward_pre_hook, dummy_forward_pre_hook
 from flashtrain.tensor_cache import adapters
 from flashtrain.tensor_cache.configs import configs
@@ -90,8 +90,11 @@ try:
 except (ImportError, ModuleNotFoundError):
     wandb = None
 
+# Import for type annotation
 from types import MethodType
 from typing import Optional
+from megatron.core.transformer.transformer_config import TransformerConfig
+
 
 
 def print_datetime(string):
@@ -184,12 +187,16 @@ def pretrain(
         group.add_argument(
             "--profile-memory-beginning", action="store_true", default=False, help="Profile the megatron initialization and the first 2 training steps."
         )
+        group.add_argument(
+            "--lossy-offload-first-iter", action="store_true", default=False, help = "Use PeakTrackNoIOLossyAdapter in the first iteration and instantiate the real adapter at the end of the first iteration."
+        )
         return parser
     
     # Parse args here temporarily to get profile-memory-beginning
     args = parse_args(args_provider, False)
     if args.profile_memory_beginning:
         torch.cuda.memory._record_memory_history(enabled='all')
+    init_memory_use_stats_recorder()
 
 
     # Initalize and get arguments, timers, and Tensorboard writer.
@@ -261,11 +268,14 @@ def pretrain(
         # logger.setLevel(logging.getLevelName("CRITICAL"))
         logging.disable()
     if args.enable_tensor_cache:
-        if args.tensor_cache_in_memory_adapter:
-            adapter = adapters.TorchMainMemoryIOAdapter()
+        if args.lossy_offload_first_iter:
+            adapter = adapters.PeakTrackNoIOLossyAdapter()
         else:
-            # adapter=adapters.TorchDummyIOAdapter(), 
-            adapter=configs.get_adapter()
+            if args.tensor_cache_in_memory_adapter:
+                adapter = adapters.TorchMainMemoryIOAdapter()
+            else:
+                # adapter=adapters.TorchDummyIOAdapter(), 
+                adapter=configs.get_adapter()
         tensor_cache = PTC.PipelineTensorCache(
             enable_activation_context_recording=args.deepspeed_activation_checkpointing,
             adapter=adapter, 
@@ -1012,8 +1022,9 @@ def train_step(
     model,
     optimizer,
     opt_param_scheduler,
-    config,
-    tensor_cache,
+    config: TransformerConfig,
+    idx_iteration: int,
+    tensor_cache: Optional[PTC.PipelineTensorCache|TC.TensorCache] = None,
 ):
     """Single training step."""
     args = get_args()
@@ -1054,10 +1065,21 @@ def train_step(
                 partition.zero_grad_buffer()
         optimizer.zero_grad()
 
-    # TODO: measure the 2nd iteration memory use here for (weight + copies + optimizer state)
-    # TODO: measure the 1st iteration memory use here for (optimizer state)
-    # TODO: measure optimizer state by (2nd iteration memmory use here - 1st iteration memory use)
-    # TODO: reset the memory peak at 2nd iteration
+    # Measure the 2nd iteration memory use here for (weight + copies + optimizer state)
+    # Measure the 1st iteration memory use here for (weight + copies) 
+    # Deduce memory use here for optimizer state (2nd iteration memmory use here - 1st iteration memory use)
+    # Reset the memory peak at 2nd iteration
+    # Clear memory cache to make sure the memory measure here is accurate
+    if idx_iteration ==  1:
+        # clear memory cache to make sure the memory measure here is accurate
+        torch.cuda.empty_cache()
+        get_memory_use_stats_recorder()["weight+weight_copies+optimizer_states"] = torch.cuda.memory_allocated()
+        get_memory_use_stats_recorder()["weight+weight_copies+optimizer_states+gradient_copies"] = torch.cuda.max_memory_allocated()
+        get_memory_use_stats_recorder()["optimizer_states"] = get_memory_use_stats_recorder()["weight+weight_copies+optimizer_states"] - get_memory_use_stats_recorder()["weight+weight_copies"]
+        get_memory_use_stats_recorder()["gradient_copies"] = get_memory_use_stats_recorder()["weight+weight_copies+optimizer_states+gradient_copies"] - get_memory_use_stats_recorder()["weight+weight_copies+optimizer_states"]
+        torch.cuda.reset_peak_memory_stats()
+    
+    
 
     # Forward pass.
     timers("forward-backward", log_level=1).start(
@@ -1119,8 +1141,18 @@ def train_step(
         unwrapped_model.cancel_gradients_last_layer(args.curr_iteration)
 
     
-    # TODO: measure the 2nd iteration memory use peak here for activation memory use peak
-    # TODO: measure the 1st iteration memory here for (weight + copies)
+    # Measure the 2nd iteration memory use peak here for activation memory use peak
+    if idx_iteration == 0:
+        # clear memory cache to make sure the memory measure here is accurate
+        torch.cuda.empty_cache()
+        get_memory_use_stats_recorder()["weight+weight_copies"] = torch.cuda.memory_allocated()
+        torch.cuda.reset_peak_memory_stats()
+    elif idx_iteration ==  1:
+        # clear memory cache to make sure the memory measure here is accurate
+        torch.cuda.empty_cache()
+        get_memory_use_stats_recorder()["weight+weight_copies+optimizer_states+activation"] = torch.cuda.max_memory_allocated()
+        get_memory_use_stats_recorder()["activation"] = get_memory_use_stats_recorder()["weight+weight_copies+optimizer_states+activation"] - get_memory_use_stats_recorder()["weight+weight_copies+optimizer_states"]
+
 
     # Update parameters.
     timers("optimizer", log_level=1).start(barrier=args.barrier_with_L1_time)
@@ -1806,6 +1838,14 @@ def training_log(
         )
         log_string += " TFLOPs: {:.2f} |".format(tflops)
         log_string += " Model size (GB): {:.2f} |".format(sum([calculate_model_weight_size(m) for m in model])/1024/1024/1024)
+        # Report memory break down
+        if iteration >=2:
+            # The iteration here is 1-based and the idx_iteration in train_step is 0-based.
+            mem_stats = get_memory_use_stats_recorder()
+            log_string += " weight+weight_copies (GB): {:.2f} |".format(mem_stats["weight+weight_copies"]/1024/1024/1024)
+            log_string += " optimizer_states (GB): {:.2f} |".format(mem_stats["optimizer_states"]/1024/1024/1024)
+            log_string += " gradient_copies (GB): {:.2f} |".format(mem_stats["gradient_copies"]/1024/1024/1024)
+            log_string += " activation (GB): {:.2f} |".format(mem_stats["activation"]/1024/1024/1024)
         total_loss_dict[advanced_iters_key] = 0
         total_loss_dict[skipped_iters_key] = 0
         total_loss_dict[nan_iters_key] = 0
@@ -1840,7 +1880,7 @@ def train(
     train_data_iterator,
     valid_data_iterator,
     process_non_loss_data_func,
-    tensor_cache: Optional[TC.TensorCache] = None,
+    tensor_cache: Optional[PTC.PipelineTensorCache|TC.TensorCache] = None,
 ):
     """Train the model function."""
     args = get_args()
@@ -1873,7 +1913,6 @@ def train(
 
     timers("interval-time", log_level=0).start(barrier=True)
     print_datetime("before the start of training step")
-    report_memory_flag = True
     if args.random_ltd:
         assert model[0].random_ltd_enabled()
         args.random_ltd_layer_num = model[
@@ -1887,19 +1926,44 @@ def train(
         if args.profile_first_iter and iteration >=2:        
             exit(0)
         # Instantiate the host_pinned_memory_allocator if it is a tracker and has tracked the peak memory
-        if iteration == 1 and args.enable_tensor_cache and args.tensor_cache_in_memory_adapter:
-            if isinstance(tensor_cache, PTC.PipelineTensorCache):
-                tensor_caches = tensor_cache.tensor_caches
-            else:
-                tensor_caches = [tensor_cache]
-            # TODO: for now, we only instantiate the adpater of the first tensor cache because we assume all tensor caches use the same adapter. We need to assert it is true in the future.
-            tc_ = tensor_caches[0]
-            # TODO: add instantiate_host_pinned_memory_allocator() as a function of OffloadEngineBase, i.e., add support in ProcessOffloadEngine as well
-            if isinstance(tc_.offloader.engine.adapter, adapters.RevolverIOAdapter):
-                for ad_ in tc_.offloader.engine.adapter.adapters:
-                    ad_.instantiate_host_pinned_memory_allocator()
-            else:
-                tc_.offloader.engine.adapter.instantiate_host_pinned_memory_allocator()
+        if iteration == 1 and args.enable_tensor_cache:
+
+            # Replace the lossy offload adapter PeakTrackNoIOLossyAdapter with the real adapter. If applicable, next clause will use the tracked peak memory as the size to be preallocated for the host pinned memory allocator.
+            peak_memory = None
+            if args.lossy_offload_first_iter:
+                if args.tensor_cache_in_memory_adapter:
+                    adapter = adapters.TorchMainMemoryIOAdapter()
+                else:
+                    # adapter=adapters.TorchDummyIOAdapter(), 
+                    adapter=configs.get_adapter()
+                if isinstance(tensor_cache, PTC.PipelineTensorCache):
+                    tensor_caches = tensor_cache.tensor_caches
+                else:
+                    tensor_caches = [tensor_cache]
+                for tc_ in tensor_caches:
+                    # Collect the tracked peak memory
+                    peak_memory = tc_.offloader.engine.adapter.get_peak_memory()
+                    # TODO: adapter replacement as a function of OffloadEngineBase, i.e., add support in ProcessOffloadEngine as well
+                    tc_.offloader.engine.adapter = adapter
+            
+            # In the first iteration, we measure how much data will be offloaded to be managed by host memory allocator, either by the lossy offloading adapter, or PeakMemoryTracker inside TorchMainMemoryIOAdapter.
+            # We use the information to preallocate the memory managed by host pinned memory allocator.
+            if args.tensor_cache_in_memory_adapter:
+                # TODO: In the first iteration, merely measure the offloaded data but discard it, i.e., not actually offload the data. In this way we can avoid the high memory use in the first iteration due to slow offloading.
+                if isinstance(tensor_cache, PTC.PipelineTensorCache):
+                    tensor_caches = tensor_cache.tensor_caches
+                else:
+                    tensor_caches = [tensor_cache]
+                # TODO: for now, we only instantiate the adpater of the first tensor cache because we assume all tensor caches use the same adapter. We need to assert it is true in the future.
+                tc_ = tensor_caches[0]
+                # TODO: add instantiate_host_pinned_memory_allocator() as a function of OffloadEngineBase, i.e., add support in ProcessOffloadEngine as well
+
+                # The peak memory will be assigned a non-None value if the lossy offload adapter PeakTrackNoIOLossyAdapter is used. Otherwise, it is None and the memory allocator preallocated size will be determined by the PeakMemoryTracker inside TorchMainMemoryIOAdapter.
+                if isinstance(tc_.offloader.engine.adapter, adapters.RevolverIOAdapter):
+                    for ad_ in tc_.offloader.engine.adapter.adapters:
+                        ad_.instantiate_host_pinned_memory_allocator(peak_memory)
+                else:
+                    tc_.offloader.engine.adapter.instantiate_host_pinned_memory_allocator(peak_memory)
         elif iteration > 1:
             # TODO: set the adaptive offloaded layer number in the second iteration
             # Clear the states of the memory allocator
@@ -1917,6 +1981,12 @@ def train(
                         ad_.host_pinned_memory_allocator.init_states()
                 else:
                     tc_.offloader.engine.adapter.host_pinned_memory_allocator.init_states()
+        
+        # Manually set the report_memory_flag in each iteration
+        if iteration == 1:    
+            report_memory_flag = True
+        else:
+            report_memory_flag = False
 
         update_num_microbatches(args.consumed_train_samples)
         if args.deepspeed:
@@ -1949,12 +2019,13 @@ def train(
             optimizer,
             opt_param_scheduler,
             config,
-            tensor_cache,
+            iteration,
+            tensor_cache
         )
         
         # Save a snapshot of the memory allocations
         # Reference: https://pytorch.org/tutorials/intermediate/optimizer_step_in_backward_tutorial.html
-        if (iteration == 4 and args.profile_memory) or (iteration ==1 and args.profile_memory_beginning):
+        if (iteration == 4 and args.profile_memory) or (iteration == 2 and args.profile_memory_beginning):
             s = torch.cuda.memory._snapshot()
             filename = f"snapshot_{torch.distributed.get_rank()}.pickle" if args.profile_memory else f"snapshot_beginning_{torch.distributed.get_rank()}.pickle"
             with open(filename, "wb") as f:
@@ -2022,7 +2093,7 @@ def train(
         params_norm = None
         if args.log_params_norm:
             params_norm = calc_params_l2_norm(model)
-        report_memory_flag = training_log(
+        training_log(
             loss_dict,
             total_loss_dict,
             optimizer.param_groups[0]["lr"],
