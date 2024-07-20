@@ -1942,7 +1942,7 @@ def train(
                     tensor_caches = [tensor_cache]
                 for tc_ in tensor_caches:
                     # Collect the tracked peak memory
-                    peak_memory = tc_.offloader.engine.adapter.get_peak_memory()
+                    peak_memory = tc_.offloader.engine.adapter.peak_tracker.get_peak_memory()
                     # TODO: adapter replacement as a function of OffloadEngineBase, i.e., add support in ProcessOffloadEngine as well
                     tc_.offloader.engine.adapter = adapter
             
