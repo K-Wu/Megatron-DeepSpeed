@@ -35,7 +35,7 @@ except ImportError:
 
 try:
     # FlashAttention (1.x)
-    from flash_attn.flash_attn_interface import flash_attn_unpadded_func
+    from flash_attn.flash_attn_interface import flash_attn_varlen_func as flash_attn_unpadded_func
     from flash_attn.flash_attn_triton import flash_attn_func
 except ImportError:
     flash_attn_unpadded_func = None
@@ -541,9 +541,7 @@ class ParallelAttention(MegatronModule):
         self.use_gqa = (self.num_attention_heads != self.num_key_value_heads)
 
         self.use_flash_attn = (args.use_flash_attn_v1 or args.use_flash_attn_triton or args.use_flash_attn_v2 or \
-            args.use_flash_attn_builder) \
-            and attention_type == AttnType.self_attn \
-            and self.attn_mask_type == AttnMaskType.causal
+            args.use_flash_attn_builder)
         self.use_flash_attn_triton = args.use_flash_attn_triton
         if self.use_flash_attn:
             global flash_attn_builder
@@ -561,10 +559,6 @@ class ParallelAttention(MegatronModule):
             if args.use_flash_attn_builder:
                 assert flash_attn_builder != None, "Cannot find FlashAttention op builder "
 
-            assert attention_type == AttnType.self_attn, ('FlashAttention code path only supports '
-                                                          'self-attention for now')
-            assert self.attn_mask_type == AttnMaskType.causal, ('FlashAttention code path only '
-                                                                'supports causal mask for now')
             if rearrange is None:
                 raise ImportError('einops is not installed, please install with pip install einops')
 
@@ -618,7 +612,7 @@ class ParallelAttention(MegatronModule):
         if self.use_flash_attn_triton:
             local_attn = FlashSelfAttentionTriton(causal=True, attention_dropout=args.attention_dropout)
         elif self.use_flash_attn:
-            local_attn = FlashSelfAttention(causal=True, attention_dropout=config.attention_dropout)
+            local_attn = FlashSelfAttention(causal=self.attn_mask_type == AttnMaskType.causal, attention_dropout=config.attention_dropout)
         else:
             local_attn = CoreAttention(self.layer_number, config, self.attn_mask_type)
 
