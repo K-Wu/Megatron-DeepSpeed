@@ -279,7 +279,7 @@ def pretrain(
         tensor_cache = PTC.PipelineTensorCache(
             enable_activation_context_recording=args.deepspeed_activation_checkpointing,
             adapter=adapter, 
-            implicit_wait_and_set_in_backward=True,
+            implicit_wait_and_set_backward=True,
             num_microbatches=get_num_microbatches(),
         )
         set_tensor_cache(tensor_cache)
