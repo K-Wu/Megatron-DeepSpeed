@@ -1235,6 +1235,7 @@ def training_log(
     num_zeros_in_grad,
     model=None,
     optimizer=None,
+    tensor_cache: Optional[PTC.PipelineTensorCache|TC.TensorCache] = None,
 ):
     """Log training information such as losses, timing, ...."""
     args = get_args()
@@ -1845,7 +1846,11 @@ def training_log(
             log_string += " weight+weight_copies (GB): {:.2f} |".format(mem_stats["weight+weight_copies"]/1024/1024/1024)
             log_string += " optimizer_states (GB): {:.2f} |".format(mem_stats["optimizer_states"]/1024/1024/1024)
             log_string += " gradient_copies (GB): {:.2f} |".format(mem_stats["gradient_copies"]/1024/1024/1024)
-            log_string += " activation (GB): {:.2f} |".format(mem_stats["activation"]/1024/1024/1024)
+            log_string += " activation peak (GB): {:.2f} |".format(mem_stats["activation"]/1024/1024/1024)
+        if tensor_cache is not None:
+            if isinstance(tensor_cache, PTC.PipelineTensorCache):
+                tensor_cache = tensor_cache.tensor_caches[0]
+            log_string += " activation by pack hook (GB): {:.2f} |".format(tensor_cache.measured_activation_gpu_memory_size/1024/1024/1024)
         total_loss_dict[advanced_iters_key] = 0
         total_loss_dict[skipped_iters_key] = 0
         total_loss_dict[nan_iters_key] = 0
@@ -2106,6 +2111,7 @@ def train(
             num_zeros_in_grad,
             model,
             optimizer,
+            tensor_cache
         )
 
         # Autoresume
