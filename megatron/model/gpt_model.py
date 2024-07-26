@@ -19,6 +19,7 @@ from megatron.model import LayerNorm, RMSNorm
 from .language_model import EmbeddingPipe
 from .transformer import ParallelTransformerLayerPipe, LMHeadPipe, get_num_experts_per_layer
 from deepspeed.pipe import PipelineModule, LayerSpec, TiedLayerSpec
+from deepspeed.runtime.activation_checkpointing import checkpointing
 
 
 try:         
@@ -460,6 +461,8 @@ class GPTModelPipe(PipelineModule,MegatronModule):
         super().__init__(layers=self.specs,
                          loss_fn=self.loss_func,
                          topology=topo,
+                         # Monkey-patch the default checkpoint method value
+                         activation_checkpoint_func=checkpointing.checkpoint,
                          activation_checkpoint_interval=interval,
                          partition_method='type:transformer')
         

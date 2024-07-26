@@ -399,7 +399,7 @@ class FlashSelfAttention(torch.nn.Module):
                            (default: 0.0)
     """
     def __init__(self, causal=False, softmax_scale=None, attention_dropout=0.0,
-                 device=None, dtype=None):
+                 device=None, dtype=None, use_checkpoint=False):
         super().__init__()
         assert flash_attn_unpadded_func is not None or flash_attn_varlen_func is not None or flash_attn_builder is not None, \
             ('Please install FlashAttention first, e.g., with pip install flash-attn or implement your own flash attention')
@@ -423,6 +423,7 @@ class FlashSelfAttention(torch.nn.Module):
         else:
             self.flash_attn_func = flash_attn_varlen_func if args.use_flash_attn_v2 else flash_attn_unpadded_func
             self.use_flash_attn = True
+        self.use_checkpoint = use_checkpoint
 
     def forward(self, q, k, v):
         """Implements the multihead softmax attention.
@@ -462,17 +463,28 @@ class FlashSelfAttention(torch.nn.Module):
                         device=q.device) if get_accelerator().device_name() == 'cuda' else None
             dropout_p = 0
 
-        if self.use_flash_attn:
-            output = self.flash_attn_func(
-                q, k, v, cu_seqlens_q, cu_seqlens_k, seqlen_q, seqlen_k,
-                dropout_p,
-                softmax_scale=self.softmax_scale, causal=is_causal
-            )
+        # Apply checkpointing the the computation logic here
+        if self.use_checkpoint:
+            if self.use_flash_attn:
+                # Convert kwargs to args
+                def custom_forward(q, k, v, cu_seqlens_q, cu_seqlens_k, seqlen_q, seqlen_k, dropout_p, softmax_scale, is_causal):
+                    return self.flash_attn_func(q, k, v, cu_seqlens_q, cu_seqlens_k, seqlen_q, seqlen_k, dropout_p, softmax_scale=softmax_scale, causal=is_causal)
+                output = tensor_parallel.checkpoint(custom_forward, False, q, k, v, cu_seqlens_q, cu_seqlens_k, seqlen_q, seqlen_k, dropout_p, self.softmax_scale, is_causal)
+            else:
+                output = tensor_parallel.checkpoint(self.flash_attn_func, False, q, k, v, dropout_p, self.softmax_scale, is_causal)
         else:
-            # use_flash_attn_builder
-            output = self.flash_attn_func(
-                q, k, v, self.dropout_p, self.softmax_scale, is_causal
-            )
+            if self.use_flash_attn:
+                output = self.flash_attn_func(
+                    q, k, v, cu_seqlens_q, cu_seqlens_k, seqlen_q, seqlen_k,
+                    dropout_p,
+                    softmax_scale=self.softmax_scale, causal=is_causal
+                )
+            else:
+                # use_flash_attn_builder
+                output = self.flash_attn_func(
+                    q, k, v, self.dropout_p, self.softmax_scale, is_causal
+                )
+        
 
         if self.use_flash_attn:
             output = rearrange(output, '(b s) ... -> b s ...', b=batch_size)
@@ -608,16 +620,25 @@ class ParallelAttention(MegatronModule):
                 bias=config.add_bias_linear,
                 gather_output=False)
 
+        self.enable_ds_sequence_parallel = parallel_state.get_sequence_parallel_world_size() > 1 \
+                                           or args.force_ds_sequence_parallel
+        # Setting up checkpoint_core_attention flag
+        if not self.enable_ds_sequence_parallel:            
+            self.checkpoint_core_attention = (config.recompute_granularity in ['selective', 'selective_both'])
+            if config.recompute_num_layers is not None and config.recompute_method == 'block':
+                if self.layer_number > config.recompute_num_layers:
+                    self.checkpoint_core_attention = False
+            if self.use_flash_attn_triton and self.checkpoint_core_attention:
+                raise ValueError('FlashAttention is not supported with selective recomputation')
+
         # Currently FlashAttention only works with causal mask
         if self.use_flash_attn_triton:
             local_attn = FlashSelfAttentionTriton(causal=True, attention_dropout=args.attention_dropout)
         elif self.use_flash_attn:
-            local_attn = FlashSelfAttention(causal=self.attn_mask_type == AttnMaskType.causal, attention_dropout=config.attention_dropout)
+            local_attn = FlashSelfAttention(causal=self.attn_mask_type == AttnMaskType.causal, attention_dropout=config.attention_dropout, use_checkpoint = self.checkpoint_core_attention)
         else:
             local_attn = CoreAttention(self.layer_number, config, self.attn_mask_type)
 
-        self.enable_ds_sequence_parallel = parallel_state.get_sequence_parallel_world_size() > 1 \
-                                           or args.force_ds_sequence_parallel
         if self.enable_ds_sequence_parallel:
             assert dist_attn_supported, 'Distributed attention is not supported in this DeepSpeed version'
             assert args.num_attention_heads % parallel_state.get_sequence_parallel_world_size() == 0
@@ -627,7 +648,6 @@ class ParallelAttention(MegatronModule):
                 self.core_attention_flash = local_attn
             else:
                 self.core_attention = local_attn
-                self.checkpoint_core_attention = (config.recompute_granularity in ['selective', 'selective_both'])
 
         # Output.
         self.dense = tensor_parallel.RowParallelLinear(
@@ -843,6 +863,7 @@ class ParallelAttention(MegatronModule):
                     query_layer, key_layer, value_layer = [rearrange(x, 's b ... -> b s ...').contiguous()
                             for x in (query_layer, key_layer, value_layer)]
 
+                # Support to checkpointing is added in FlashSelfAttention forward class
                 if self.sequence_parallel:
                     context_layer = self.core_attention_flash(query_layer, key_layer, value_layer)
                 else:
@@ -2009,6 +2030,8 @@ class ParallelTransformer(MegatronModule):
 
                     if self.transformer_impl == 'transformer_engine':
                         forward_kwargs['is_first_microbatch'] = is_first_microbatch
+                        if self.recompute_num_layers is not None and self.recompute_method == 'block':
+                            raise ValueError("Block recompute method is not supported with Transformer Engine.")
                         forward_kwargs['checkpoint_core_attention'] = self.checkpoint_core_attention
                         if self.transformer_engine_rope_available:
                             forward_kwargs['rotary_pos_emb'] = rotary_pos_emb

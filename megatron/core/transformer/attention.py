@@ -30,6 +30,9 @@ class Attention(MegatronModule, ABC):
     ):
         super().__init__(config=config)
 
+        # the layer_number is an integer starting from 1 and incorporate the offset introduced by the pipeline parallelism
+        # TODO: support recompute_num_layers when the pipeline parallelism is enabled, i.e., subtracting offset from the layer_number when checking the condition
+
         self.config = config
         self.layer_number = layer_number
         self.attn_mask_type = attn_mask_type
@@ -48,6 +51,9 @@ class Attention(MegatronModule, ABC):
         )
 
         self.checkpoint_core_attention = (self.config.recompute_granularity in ['selective', 'selective_both'])
+        if self.config.recompute_num_layers is not None and self.config.recompute_method == 'block':
+            if self.layer_number > self.config.recompute_num_layers:
+                self.checkpoint_core_attention = False
 
         # Output.
         self.linear_proj = TERowParallelLinear(

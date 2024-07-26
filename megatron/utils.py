@@ -267,7 +267,7 @@ def get_parameters_in_billions(model):
 
     return approx_parameters_in_billions*gpus_per_model/(1e9)
 
-def throughput_calculator(model, args, iteration_time, total_iterations):
+def throughput_calculator(model, args, iteration_time, total_iterations, return_model_flops = False):
     batch_size = args.micro_batch_size * get_num_microbatches() * args.data_parallel_size
     approx_parameters_in_billions = None if (model is None) else get_parameters_in_billions(model)
     elapsed_time_per_iter = iteration_time/total_iterations
@@ -283,10 +283,11 @@ def throughput_calculator(model, args, iteration_time, total_iterations):
     # The factor of 4 is when used with activation check-pointing,
     # otherwise it will be 3.
     checkpoint_activations_factor = 3
-    if hasattr(args, 'checkpoint_activations') and args.checkpoint_activations:
-        checkpoint_activations_factor = 4
-    if hasattr(args, 'recompute_granularity') and (args.recompute_granularity == 'selective' or args.recompute_granularity == 'selective_both' or args.recompute_granularity == 'selective_mlp_only'  or args.recompute_granularity == 'full'):
-        checkpoint_activations_factor = 4
+    if not return_model_flops:
+        if hasattr(args, 'checkpoint_activations') and args.checkpoint_activations:
+            checkpoint_activations_factor = 4
+        if hasattr(args, 'recompute_granularity') and (args.recompute_granularity == 'selective' or args.recompute_granularity == 'selective_both' or args.recompute_granularity == 'selective_mlp_only'  or args.recompute_granularity == 'full'):
+            checkpoint_activations_factor = 4
     seq_len = args.seq_length
     if hasattr(args, 'actual_seq_length'):
         seq_len = args.actual_seq_length

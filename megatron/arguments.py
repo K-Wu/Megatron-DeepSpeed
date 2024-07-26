@@ -369,7 +369,7 @@ def validate_args(args, defaults={}):
     assert not (args.fp8_e4m3 and args.fp8_hybrid), \
         'cannot train with both fp8 e4m3 and hybrid formatting'
 
-    if args.recompute_granularity in ['selective', 'selective_mlp_only', 'selective_both']:
+    if args.recompute_granularity in ['selective_mlp_only', 'selective_both']:
         assert args.recompute_method is None, \
             'recompute method is not yet supported for ' \
             'selective recomputing granularity'

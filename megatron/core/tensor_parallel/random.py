@@ -34,6 +34,56 @@ _MODEL_PARALLEL_RNG_TRACKER_NAME = 'model-parallel-rng'
 # Whether apply model parallelsim to checkpointed hidden states.
 _CHECKPOINTED_ACTIVATIONS_MEMORY_BUFFER = None
 
+def extract_tensors(all_objects):
+    """
+    From deepspeed/runtime/activation_checkpointing/checkpointing.py
+    Separate objects in list/tuple into tensors and non-tensors and create a mapping to enable re-aggregation.
+    The order of tensors and non-tensors is preserved in their respective output groups.
+
+    Parameters:
+        all_objects (list/tuple): Objects containing tensors and non-tensors to be split.
+
+    Returns:
+        tuple: Containing tensors, non-tensors, and bools of whether each position in original list/tuple was a tensor.
+
+    """
+    tensor_objects = [v for v in all_objects if torch.is_tensor(v)]
+    non_tensor_objects = [v for v in all_objects if not torch.is_tensor(v)]
+    tensor_flags = [torch.is_tensor(v) for v in all_objects]
+    if type(all_objects) is tuple:
+        return tuple(tensor_objects), tuple(non_tensor_objects), tuple(tensor_flags)
+    return tensor_objects, non_tensor_objects, tensor_flags
+    
+
+def merge_tensors(tensor_objects, non_tensor_objects, tensor_flags):
+    """
+    Adapted from deepspeed/runtime/activation_checkpointing/checkpointing.py
+    Merge two lists (or tuples) of tensors and non-tensors using a mapping of positions in merged list (or tuple).
+
+    Parameters:
+        tensor_objects (list/tuple): Tensors to merge.
+        non_tensor_objects (list/tuple): Non-tensors to merge.
+        tensor_flags (list/tuple): Indicates whether each position in output is a tensor.
+
+    Returns:
+        tuple: Merge of tensors and non-tensors
+    """
+    merged_objects = []
+    tensor_idx = 0
+    non_tensor_idx = 0
+
+    real_tensor_flags = tensor_flags
+
+    for is_tensor in real_tensor_flags:
+        if is_tensor:
+            merged_objects.append(tensor_objects[tensor_idx])
+            tensor_idx += 1
+        else:
+            merged_objects.append(non_tensor_objects[non_tensor_idx])
+            non_tensor_idx += 1
+
+    return tuple(merged_objects)
+
 
 def init_checkpointed_activations_memory_buffer():
     """Initializ the memory buffer for the checkpointed activations."""
@@ -265,9 +315,17 @@ class CheckpointFunction(torch.autograd.Function):
             args[0].data = split_tensor_into_1d_equal_chunks(args[0].data)
             args[0].data = _CHECKPOINTED_ACTIVATIONS_MEMORY_BUFFER.add(
                 args[0].data)
+            
+        
 
         # Store everything.
-        ctx.save_for_backward(*args)
+        def save_args_for_backward(*all_args):
+            # From deepspeed/runtime/activation_checkpointing/checkpointing.py
+            tensor_args, non_tensor_args, tensor_flags = extract_tensors(all_objects=all_args)
+            ctx.save_for_backward(*tensor_args)
+            ctx.non_tensor_args = non_tensor_args
+            ctx.tensor_flags = tensor_flags
+        save_args_for_backward(*args)
 
         return outputs
 
@@ -276,7 +334,12 @@ class CheckpointFunction(torch.autograd.Function):
         if not torch.autograd._is_checkpoint_valid():
             raise RuntimeError("Checkpointing is not compatible with .grad(), "
                                "please use .backward() if possible")
-        inputs = ctx.saved_tensors
+        inputs_tensors = ctx.saved_tensors
+        inputs = merge_tensors(tensor_objects=inputs_tensors,
+                                        non_tensor_objects=ctx.non_tensor_args,
+                                        tensor_flags=ctx.tensor_flags)
+        ctx.non_tensor_args = None
+        ctx.tensor_flags = None
         if ctx.distribute_saved_activations:
             safely_set_viewless_tensor_data(
                 inputs[0],
@@ -316,7 +379,7 @@ class CheckpointFunction(torch.autograd.Function):
             outputs = (outputs[0],)
         torch.autograd.backward(outputs, args)
         grads = tuple(inp.grad if isinstance(inp, torch.Tensor) else inp
-                      for inp in detached_inputs)
+                      for inp in detached_inputs[:len(inputs_tensors)]) + (None,) * (len(inputs) - len(inputs_tensors))
         return (None, None) + grads
 
 

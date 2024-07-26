@@ -15,6 +15,7 @@ import torch
 from collections import OrderedDict
 from torch.nn.parallel.distributed import DistributedDataParallel as torchDDP
 
+import megatron
 from megatron import get_args
 from megatron import get_signal_handler
 from megatron import get_timers
@@ -65,6 +66,7 @@ from deepspeed import comm as dist
 import logging
 import flashtrain.tensor_cache
 from flashtrain.utils import calculate_model_weight_size
+from flashtrain.tensor_cache import reevaluator
 from flashtrain.tensor_cache import monkey_patched_deepspeed_checkpoint
 from flashtrain.tensor_cache import pipeline_tensor_cache as PTC
 from flashtrain.tensor_cache import tensor_cache as TC
@@ -194,6 +196,9 @@ def pretrain(
         group.add_argument(
             "--cufile-malloc-hook-is-used", action="store_true", default=False, help="Set this flag if the malloc host registering the buffer for cuFile is used."
         )
+        group.add_argument(
+            "--use-reevaluator", action="store_true", default=False, help="Use reevaluator for activation checkpointing."
+        )
         return parser
     
     # Parse args here temporarily to get profile-memory-beginning
@@ -284,7 +289,7 @@ def pretrain(
             # adapter=adapters.TorchDummyIOAdapter(), 
             adapter=configs.get_adapter()
         tensor_cache = PTC.PipelineTensorCache(
-            enable_activation_context_recording=args.deepspeed_activation_checkpointing,
+            enable_activation_context_recording=args.deepspeed_activation_checkpointing or args.recompute_granularity is not None,
             adapter=adapter, 
             implicit_wait_and_set_backward=True,
             num_microbatches=get_num_microbatches(),
@@ -395,6 +400,13 @@ def pretrain(
             
     # Monkey patch activation checkpoint function to trigger pack/unpack hook
     deepspeed.runtime.activation_checkpointing.checkpointing.CheckpointFunction = monkey_patched_deepspeed_checkpoint.CheckpointFunction
+
+    # Monkey patch activation checkpoint function to use reevaluator
+    if args.use_reevaluator:
+        assert args.enable_tensor_cache
+        deepspeed.runtime.activation_checkpointing.checkpointing.checkpoint = reevaluator.deepspeed.reevaluator
+        megatron.core.tensor_parallel.random.checkpoint = reevaluator.megatron_deepspeed.reevaluator
+
 
     if args.enable_tensor_cache:
         # Monkey patch _exec_schedule of PipelineEngine to incorporate tensor cache
@@ -1740,8 +1752,8 @@ def training_log(
         seq_len = args.seq_length
         if hasattr(args, "actual_seq_length"):
             seq_len = args.actual_seq_length
-        samples_per_sec, tflops, approx_parameters_in_billions = (
-            throughput_calculator(model, args, elapsed_time, total_iterations)
+        samples_per_sec, model_tflops, approx_parameters_in_billions = (
+            throughput_calculator(model, args, elapsed_time, total_iterations, True)
         )
         samples_per_sec_per_replica = samples_per_sec / args.data_parallel_size
         tokens_per_sec = samples_per_sec * seq_len
@@ -1760,7 +1772,7 @@ def training_log(
                 "throughput/tokens_per_sec_per_replica": tokens_per_sec_per_replica,
                 "throughput/tokens_per_gpu_per_sec": tokens_per_gpu_per_second,
                 "throughput/tokens_per_gpu_per_sec_per_replica": tokens_per_gpu_per_second_per_replica,
-                "throughput/tflops": tflops,
+                "throughput/model_tflops": model_tflops,
                 "throughput/approx_params_in_billions": approx_parameters_in_billions,
                 "throughput/elapsed_ms_per_iteration": elapsed_time_per_iteration,
                 "throughput/iteration": iteration,
@@ -1857,7 +1869,7 @@ def training_log(
         log_string += " tokens per gpu per second (tgs): {:.3f} |".format(
             tokens_per_gpu_per_second
         )
-        log_string += " TFLOPs: {:.2f} |".format(tflops)
+        log_string += " Model TFLOPs: {:.2f} |".format(model_tflops)
         log_string += " Model size (GB): {:.2f} |".format(sum([calculate_model_weight_size(m) for m in model])/1024/1024/1024)
         # Report memory break down
         if iteration >=3:
