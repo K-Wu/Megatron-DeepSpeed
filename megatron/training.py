@@ -185,6 +185,9 @@ def pretrain(
             "--profile-first-iter", action="store_true", default=False
         )
         group.add_argument(
+            "--ends-on", type=int, default=None
+        )
+        group.add_argument(
             "--profile-memory", action="store_true", default=False, help="Profile the first 10 training steps. Use https://pytorch.org/memory_viz to open the .pickle file generated. The dumping may take a few minutes."
         )
         group.add_argument(
@@ -1097,7 +1100,9 @@ def train_step(
     # Deduce memory use here for optimizer state (3rd iteration memmory use here - 1st iteration memory use)
     # Reset the memory peak at 2nd iteration
     # Clear memory cache to make sure the memory measure here is accurate
-    if idx_iteration ==  2:
+    if idx_iteration > 2:
+        torch.cuda.reset_peak_memory_stats()
+    elif idx_iteration ==  2:
         # clear memory cache to make sure the memory measure here is accurate
         torch.cuda.empty_cache()
         get_memory_use_stats_recorder()["weight+weight_copies+optimizer_states"] = torch.cuda.memory_allocated()
@@ -1184,7 +1189,9 @@ def train_step(
         torch.cuda.empty_cache()
         get_memory_use_stats_recorder()["weight+weight_copies+optimizer_states+activation"] = torch.cuda.max_memory_allocated()
         get_memory_use_stats_recorder()["activation"] = get_memory_use_stats_recorder()["weight+weight_copies+optimizer_states+activation"] - get_memory_use_stats_recorder()["weight+weight_copies+optimizer_states"]
-
+        torch.cuda.reset_peak_memory_stats()
+    elif idx_iteration >2:
+        get_memory_use_stats_recorder()["current_iter_activation"] = torch.cuda.max_memory_allocated() - get_memory_use_stats_recorder()["weight+weight_copies+optimizer_states"]
 
     # Update parameters.
     timers("optimizer", log_level=1).start(barrier=args.barrier_with_L1_time)
@@ -1879,6 +1886,8 @@ def training_log(
             log_string += " [optimizer_states (GB): {:.2f}]".format(mem_stats["optimizer_states"]/1024/1024/1024)
             #log_string += " [gradient_copies (GB): {:.2f}]".format(mem_stats["gradient_copies"]/1024/1024/1024)
             log_string += " [activation peak (GB): {:.2f}]".format(mem_stats["activation"]/1024/1024/1024)
+            if "current_iter_activation" in mem_stats:
+                log_string += " [activation current iter peak (GB): {:.2f}]".format(mem_stats["current_iter_activation"]/1024/1024/1024)
         if tensor_cache is not None:
             if isinstance(tensor_cache, PTC.PipelineTensorCache):
                 tensor_cache = tensor_cache.tensor_caches[0]
@@ -1966,6 +1975,8 @@ def train(
         args.train_tokens is None
         or args.consumed_train_tokens < args.train_tokens
     ):
+        if args.ends_on is not None and args.ends_on < iteration:
+            exit(0)
         if args.profile_first_iter and iteration >=3:        
             exit(0)
         # Instantiate the host_pinned_memory_allocator if it is a tracker and has tracked the peak memory
