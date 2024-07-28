@@ -66,7 +66,8 @@ from deepspeed import comm as dist
 import logging
 import flashtrain.tensor_cache
 from flashtrain.utils import calculate_model_weight_size
-from flashtrain.tensor_cache import reevaluator
+from flashtrain.tensor_cache.reevaluator import deepspeed as reevaluate_ds
+from flashtrain.tensor_cache.reevaluator import megatron_deepspeed as reevaluate_megatron_ds
 from flashtrain.tensor_cache import monkey_patched_deepspeed_checkpoint
 from flashtrain.tensor_cache import pipeline_tensor_cache as PTC
 from flashtrain.tensor_cache import tensor_cache as TC
@@ -407,8 +408,8 @@ def pretrain(
     # Monkey patch activation checkpoint function to use reevaluator
     if args.use_reevaluator:
         assert args.enable_tensor_cache
-        deepspeed.runtime.activation_checkpointing.checkpointing.checkpoint = reevaluator.deepspeed.reevaluator
-        megatron.core.tensor_parallel.random.checkpoint = reevaluator.megatron_deepspeed.reevaluator
+        deepspeed.runtime.activation_checkpointing.checkpointing.checkpoint = reevaluate_ds.reevaluator
+        megatron.core.tensor_parallel.random.checkpoint = reevaluate_megatron_ds.reevaluator
 
 
     if args.enable_tensor_cache:
