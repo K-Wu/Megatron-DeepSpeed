@@ -1900,7 +1900,7 @@ def training_log(
                 cufile_malloc_hook = flashtrain.tensor_cache.get_cufile_malloc_hook()
                 log_string += " [cuFile malloc hook in use num_allocs: {} num_frees: {}]".format(cufile_malloc_hook.get_num_allocs(), cufile_malloc_hook.get_num_frees())
         if iteration>=3:            
-            print("{op stat "+get_oneline_str(f"{optimizer.state.keys()}") + "}")
+            print("{length of op stat "+get_oneline_str(f"{len(optimizer.state.keys())}") + "}")
         total_loss_dict[advanced_iters_key] = 0
         total_loss_dict[skipped_iters_key] = 0
         total_loss_dict[nan_iters_key] = 0
