@@ -395,7 +395,7 @@ def forward_backward_no_pipelining(
 
 
     args = get_args()
-    if args.profile_first_iter:        
+    if args.profile_first_iter or args.profile_first_iter_longer:        
         #from cProfile import Profile
         #from pstats import SortKey, Stats
         from pyinstrument import Profiler
@@ -478,7 +478,7 @@ def forward_backward_no_pipelining(
         )
         wait_current_stage_if_not_None(tensor_cache)
 
-    if args.profile_first_iter:
+    if args.profile_first_iter or args.profile_first_iter_longer:
         profiler.stop()
         if torch.distributed.get_rank() == 0:
             profiler.print()

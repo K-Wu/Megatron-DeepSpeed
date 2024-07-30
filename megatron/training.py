@@ -186,6 +186,9 @@ def pretrain(
             "--profile-first-iter", action="store_true", default=False
         )
         group.add_argument(
+            "--profile-first-iter-longer", action="store_true", default=False
+        )
+        group.add_argument(
             "--ends-on", type=int, default=None
         )
         group.add_argument(
@@ -297,6 +300,7 @@ def pretrain(
             adapter=adapter, 
             implicit_wait_and_set_backward=True,
             num_microbatches=get_num_microbatches(),
+            nvtx_enabled=args.profile_first_iter or args.profile_first_iter_longer,
         )
         
         if args.lossy_offload_first_iter:
@@ -1649,7 +1653,6 @@ def training_log(
                     op=torch.distributed.ReduceOp.MAX,
                     group=mpu.get_pipeline_model_parallel_group(),
                 )
-
             # print('step {} rank {} after sync opt_stats {}, {}'.format(iteration, torch.distributed.get_rank(), opt_stats_2, opt_stats))
             if writer and is_last_rank():
                 writer.add_scalar(
@@ -1896,17 +1899,18 @@ def training_log(
             if args.cufile_malloc_hook_is_used:
                 cufile_malloc_hook = flashtrain.tensor_cache.get_cufile_malloc_hook()
                 log_string += " [cuFile malloc hook in use num_allocs: {} num_frees: {}]".format(cufile_malloc_hook.get_num_allocs(), cufile_malloc_hook.get_num_frees())
-
+        if iteration>=3:            
+            print("{op stat "+get_oneline_str(f"{optimizer.state.keys()}") + "}")
         total_loss_dict[advanced_iters_key] = 0
         total_loss_dict[skipped_iters_key] = 0
         total_loss_dict[nan_iters_key] = 0
         print_rank_last(log_string) 
         if args.tensor_cache_in_memory_adapter:
             print_rank_last("Host pinned memory in use!!")
-        if report_memory_flag and learning_rate > 0.0:
+        if report_memory_flag:
             # Report memory after optimizer state has been initialized.
             report_memory("(after {} iterations)".format(iteration))
-            report_memory_flag = False
+            # report_memory_flag = False
         timers.log(timers_to_log, normalizer=args.log_interval)
 
     return report_memory_flag
@@ -1980,6 +1984,8 @@ def train(
             exit(0)
         if args.profile_first_iter and iteration >=3:        
             exit(0)
+        if args.profile_first_iter_longer and iteration >=8:
+            exit(0)
         # Instantiate the host_pinned_memory_allocator if it is a tracker and has tracked the peak memory
         if iteration == 1 and args.enable_tensor_cache:
 
@@ -2032,7 +2038,7 @@ def train(
                     tc_.offloader.engine.adapter.host_pinned_memory_allocator.init_states()
         
         # Manually set the report_memory_flag in each iteration
-        if iteration == 1:    
+        if iteration >= 1:    
             report_memory_flag = True
         else:
             report_memory_flag = False

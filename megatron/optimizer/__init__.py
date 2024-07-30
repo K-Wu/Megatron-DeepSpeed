@@ -109,6 +109,10 @@ def get_megatron_optimizer(model,
                             lr=args.lr,
                             weight_decay=args.weight_decay,
                             momentum=args.sgd_momentum)
+        elif args.optimizer == 'sgdsimple':
+            optimizer = SGD(param_groups,
+                            lr=args.lr,
+                            weight_decay=args.weight_decay)
         else:
             raise Exception('{} optimizer is not supported.'.format(
             args.optimizer))
