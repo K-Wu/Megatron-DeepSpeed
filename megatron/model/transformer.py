@@ -626,7 +626,7 @@ class ParallelAttention(MegatronModule):
         if not self.enable_ds_sequence_parallel:            
             self.checkpoint_core_attention = (config.recompute_granularity in ['selective', 'selective_both'])
             if config.recompute_num_layers is not None and config.recompute_method == 'block':
-                if self.layer_number > config.recompute_num_layers:
+                if self.layer_number >= config.recompute_num_layers:
                     self.checkpoint_core_attention = False
             if self.use_flash_attn_triton and self.checkpoint_core_attention:
                 raise ValueError('FlashAttention is not supported with selective recomputation')
