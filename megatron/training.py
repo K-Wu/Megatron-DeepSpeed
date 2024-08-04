@@ -206,6 +206,12 @@ def pretrain(
         group.add_argument(
             "--use-reevaluator", action="store_true", default=False, help="Use reevaluator for activation checkpointing."
         )
+        group.add_argument(
+            "--switch-to-dummy-adapter-at-ten", action="store_true", default=False,help="Replace the adapter with a dummy adapter at 10th iteration for debugging purpose"
+        )
+        group.add_argument(
+            "--disable-detach-in-kvikio", action="store_true", default=False, help="Disable detach in KvikioIOAdapter. If GPT model crashes, try setting this flag."
+        )
         return parser
     
     # Parse args here temporarily to get profile-memory-beginning
@@ -295,6 +301,16 @@ def pretrain(
         else:
             # adapter=adapters.TorchDummyIOAdapter(), 
             adapter=configs.get_adapter()
+        if args.disable_detach_in_kvikio:
+            from flashtrain.tensor_cache.adapters import RevolverIOAdapter, KvikioIOAdapter
+            if isinstance(adapter, RevolverIOAdapter):
+                adapters = adapter.adapters
+            else:
+                adapters = [adapter]
+            # Handle KvikioIOAdapter is_async False case
+            for adapter in adapters:
+                if isinstance(adapter, KvikioIOAdapter):
+                    adapter.enable_detach = False
         tensor_cache = PTC.PipelineTensorCache(
             enable_activation_context_recording=args.deepspeed_activation_checkpointing or args.recompute_granularity is not None,
             adapter=adapter, 
@@ -2036,7 +2052,16 @@ def train(
                         ad_.host_pinned_memory_allocator.init_states()
                 else:
                     tc_.offloader.engine.adapter.host_pinned_memory_allocator.init_states()
-        
+
+        if iteration == 10 and args.enable_tensor_cache and args.switch_to_dummy_adapter_at_ten:
+            # Replace the adapter with a dummy adapter for debugging purpose.
+            if isinstance(tensor_cache, PTC.PipelineTensorCache):
+                tensor_caches = tensor_cache.tensor_caches
+            else:
+                tensor_caches = [tensor_cache]
+            for tc_ in tensor_caches:
+                tc_.offloader.engine.switch_to_dummy_adapter()
+
         # Manually set the report_memory_flag in each iteration
         if iteration >= 1:    
             report_memory_flag = True
@@ -2083,7 +2108,7 @@ def train(
         
         # Save a snapshot of the memory allocations
         # Reference: https://pytorch.org/tutorials/intermediate/optimizer_step_in_backward_tutorial.html
-        if (iteration == 4 and args.profile_memory) or (iteration == 3 and args.profile_memory_beginning):
+        if (iteration == 4 and args.profile_memory) or (iteration == 5 and args.profile_memory_beginning):
             s = torch.cuda.memory._snapshot()
             filename = f"snapshot_{torch.distributed.get_rank()}.pickle" if args.profile_memory else f"snapshot_beginning_{torch.distributed.get_rank()}.pickle"
             with open(filename, "wb") as f:

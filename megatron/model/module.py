@@ -130,6 +130,8 @@ def conversion_helper(val, conversion):
 def fp32_to_float16(val, float16_convertor):
     """Convert fp32 `val` to fp16/bf16"""
     def half_conversion(val):
+        if val is None:
+            return val
         val_typecheck = val
         if isinstance(val_typecheck, (Parameter, Variable)):
             val_typecheck = val.data
