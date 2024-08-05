@@ -73,7 +73,7 @@ from flashtrain.tensor_cache import pipeline_tensor_cache as PTC
 from flashtrain.tensor_cache import tensor_cache as TC
 from flashtrain.tensor_cache import set_tensor_cache, get_memory_use_stats_recorder,init_memory_use_stats_recorder
 from flashtrain.tensor_cache.dummy_hooks import dummy_forward_hook, dummy_full_backward_hook, dummy_full_backward_pre_hook, dummy_forward_pre_hook
-from flashtrain.tensor_cache import adapters
+from flashtrain.tensor_cache import adapters as tcadapters
 from flashtrain.tensor_cache.configs import configs
 from flashtrain.logger import logger, get_oneline_str
 from flashtrain.utils import (
@@ -130,6 +130,22 @@ def _create_ds_config_dict():
 
     return ds_config_dict
 
+def get_tensor_cache(args):
+    if args.tensor_cache_in_memory_adapter:
+        adapter = tcadapters.TorchMainMemoryIOAdapter()
+    else:
+        # adapter=adapters.TorchDummyIOAdapter(), 
+        adapter=configs.get_adapter()
+    tensor_cache = PTC.PipelineTensorCache(
+        adaptive_keep=not args.disable_adaptive_keep,
+        enable_activation_context_recording=args.deepspeed_activation_checkpointing or args.recompute_granularity is not None,
+        adapter=adapter, 
+        implicit_wait_and_set_backward=True,
+        num_microbatches=get_num_microbatches(),
+        nvtx_enabled=args.profile_first_iter or args.profile_first_iter_longer or args.profile_memory or args.profile_memory_beginning,
+    )
+    return tensor_cache
+
 
 def pretrain(
     train_valid_test_dataset_provider,
@@ -177,6 +193,9 @@ def pretrain(
             "--enable-tensor-cache", action="store_true", default=False
         )
         group.add_argument(
+            "--tensor-cache-reset-in-every-iteration", action="store_true", default=False
+        )
+        group.add_argument(
             "--tensor-cache-in-memory-adapter", action="store_true", default=False
         )
         group.add_argument(
@@ -210,7 +229,7 @@ def pretrain(
             "--switch-to-dummy-adapter-at-ten", action="store_true", default=False,help="Replace the adapter with a dummy adapter at 10th iteration for debugging purpose"
         )
         group.add_argument(
-            "--disable-detach-in-kvikio", action="store_true", default=False, help="Disable detach in KvikioIOAdapter. If GPT model crashes, try setting this flag."
+            "--disable-adaptive-keep", action="store_true", default=False, help="Disable adaptive keep in PeakTrackNoIOLossyAdapter."
         )
         return parser
     
@@ -296,28 +315,7 @@ def pretrain(
         # logger.setLevel(logging.getLevelName("CRITICAL"))
         logging.disable()
     if args.enable_tensor_cache:
-        if args.tensor_cache_in_memory_adapter:
-            adapter = adapters.TorchMainMemoryIOAdapter()
-        else:
-            # adapter=adapters.TorchDummyIOAdapter(), 
-            adapter=configs.get_adapter()
-        if args.disable_detach_in_kvikio:
-            from flashtrain.tensor_cache.adapters import RevolverIOAdapter, KvikioIOAdapter
-            if isinstance(adapter, RevolverIOAdapter):
-                adapters = adapter.adapters
-            else:
-                adapters = [adapter]
-            # Handle KvikioIOAdapter is_async False case
-            for adapter in adapters:
-                if isinstance(adapter, KvikioIOAdapter):
-                    adapter.enable_detach = False
-        tensor_cache = PTC.PipelineTensorCache(
-            enable_activation_context_recording=args.deepspeed_activation_checkpointing or args.recompute_granularity is not None,
-            adapter=adapter, 
-            implicit_wait_and_set_backward=True,
-            num_microbatches=get_num_microbatches(),
-            nvtx_enabled=args.profile_first_iter or args.profile_first_iter_longer,
-        )
+        tensor_cache = get_tensor_cache(args)
         
         if args.lossy_offload_first_iter:
             if isinstance(tensor_cache, PTC.PipelineTensorCache):
@@ -372,7 +370,6 @@ def pretrain(
                     raise RuntimeError(
                         f"{self.__class__.__name__} does not understand instruction {repr(cmd)}"
                     )
-
                 next_idx_microbatch, next_stage = (
                     deepspeed_get_next_microbatch_idx_and_stage(
                         idx_cmd, step_cmds
@@ -1057,7 +1054,7 @@ def setup_model_and_optimizer(
     ):
         print_rank_0("Initializing ICT from pretrained BERT model")
         unwrapped_model[0].init_state_dict_from_bert()
-        if args.fp16:
+        if args.fp16 or args.bf16:
             optimizer.reload_model_params()
 
     # random-LTD requires converting transformer layers
@@ -2030,7 +2027,7 @@ def train(
                 # TODO: add instantiate_host_pinned_memory_allocator() as a function of OffloadEngineBase, i.e., add support in ProcessOffloadEngine as well
 
                 # The peak memory will be assigned a non-None value if the lossy offload adapter PeakTrackNoIOLossyAdapter is used. Otherwise, it is None and the memory allocator preallocated size will be determined by the PeakMemoryTracker inside TorchMainMemoryIOAdapter.
-                if isinstance(tc_.offloader.engine.adapter, adapters.RevolverIOAdapter):
+                if isinstance(tc_.offloader.engine.adapter, tcadapters.RevolverIOAdapter):
                     for ad_ in tc_.offloader.engine.adapter.adapters:
                         ad_.instantiate_host_pinned_memory_allocator(peak_memory)
                 else:
@@ -2047,11 +2044,38 @@ def train(
                 # TODO: for now, we only instantiate the adpater of the first tensor cache because we assume all tensor caches use the same adapter. We need to assert it is true in the future.
                 tc_ = tensor_caches[0]
                 # TODO: add instantiate_host_pinned_memory_allocator() as a function of OffloadEngineBase, i.e., add support in ProcessOffloadEngine as well
-                if isinstance(tc_.offloader.engine.adapter, adapters.RevolverIOAdapter):
+                if isinstance(tc_.offloader.engine.adapter, tcadapters.RevolverIOAdapter):
                     for ad_ in tc_.offloader.engine.adapter.adapters:
                         ad_.host_pinned_memory_allocator.init_states()
                 else:
                     tc_.offloader.engine.adapter.host_pinned_memory_allocator.init_states()
+            if args.enable_tensor_cache and args.tensor_cache_reset_in_every_iteration:
+                del tensor_cache
+                del flashtrain.tensor_cache.__GLOBAL_TENSOR_CACHE
+                tensor_cache = get_tensor_cache(args)
+                set_tensor_cache(tensor_cache, reset_flag=True)
+                for idx_tc_, tc_ in enumerate(tensor_cache.tensor_caches):
+                    for model_module in model:
+                        if idx_tc_ == 0:
+                            logger.info(get_oneline_str("names of parameters", [n for n,p in model_module.named_parameters()]))
+                        tc_.add_parameters_from_module(model_module)
+                        register_transpose_of_linear_weights(model_module, tc_)
+                forward_pre_hook = tensor_cache.get_forward_pre_hook()
+                forward_hook = tensor_cache.get_forward_hook()
+                full_backward_hook = tensor_cache.get_full_backward_hook()
+                full_backward_pre_hook = tensor_cache.get_full_backward_pre_hook()
+                torch.nn.modules.module.register_module_forward_pre_hook(
+                    forward_pre_hook
+                )
+                torch.nn.modules.module.register_module_forward_hook(
+                    forward_hook
+                )
+                torch.nn.modules.module.register_module_full_backward_pre_hook(
+                    full_backward_pre_hook
+                )
+                torch.nn.modules.module.register_module_full_backward_hook(
+                    full_backward_hook
+                )
 
         if iteration == 10 and args.enable_tensor_cache and args.switch_to_dummy_adapter_at_ten:
             # Replace the adapter with a dummy adapter for debugging purpose.
@@ -2191,7 +2215,15 @@ def train(
             optimizer,
             tensor_cache
         )
-
+        if args.enable_tensor_cache:
+            if isinstance(tensor_cache, PTC.PipelineTensorCache):
+                tensor_caches = tensor_cache.tensor_caches
+            else:
+                tensor_caches = [tensor_cache]
+            for tc_ in tensor_caches:
+                tc_.offloader.clear_tensor_id_to_loaded_tensor()
+                
+                
         # Autoresume
         if args.adlr_autoresume and (
             iteration % args.adlr_autoresume_interval == 0

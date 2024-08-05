@@ -54,7 +54,7 @@ def post_language_model_processing(lm_output, labels, logit_weights,
         cross_entropy = sequence_parallel.vocab_sequence_parallel_cross_entropy if mpu.get_sequence_parallel_world_size() > 1 \
             else tensor_parallel.vocab_parallel_cross_entropy
         if fp16_lm_cross_entropy:
-            assert output.dtype == torch.half
+            assert output.dtype == torch.half or output.dtype == torch.bfloat16
             loss = cross_entropy(output, labels)
         else:
             loss = cross_entropy(output.float(), labels)

@@ -96,7 +96,9 @@ def init_checkpointed_activations_memory_buffer():
     num_checkpointer_layers = args.num_layers // args.checkpoint_num_layers
     numel = per_layer * num_checkpointer_layers
     dtype = torch.half
-    if not args.fp16:
+    if args.bf16:
+        dtype = torch.bfloat16
+    elif not args.fp16:
         dtype = torch.float
 
     global _CHECKPOINTED_ACTIVATIONS_MEMORY_BUFFER
