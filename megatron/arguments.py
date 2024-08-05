@@ -483,7 +483,7 @@ def core_transformer_config_from_args(args):
     kw_args['pipeline_dtype'] = args.params_dtype
     kw_args['batch_p2p_comm'] = not args.overlap_p2p_comm
     if args.swiglu:
-        kw_args['activation_func'] = F.silu
+        # kw_args['activation_func'] = F.silu
         kw_args['gated_linear_unit'] = True
         kw_args['bias_gelu_fusion'] = False
     if args.init_method_xavier_uniform:
