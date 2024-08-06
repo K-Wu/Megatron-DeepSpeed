@@ -306,7 +306,7 @@ def pretrain(
     )
 
     # Set up pipeline tensor cache
-    if torch.distributed.get_rank() == 0:
+    if torch.distributed.get_rank() == 1:
         # logger.setLevel(logging.getLevelName("CRITICAL"))
         # logger.setLevel(logging.getLevelName("ERROR"))
         # logger.setLevel(logging.getLevelName("INFO"))

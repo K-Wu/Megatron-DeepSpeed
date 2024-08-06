@@ -278,7 +278,7 @@ def validate_args(args, defaults={}):
     # Checks.
     if not args.use_dataset_only:
         if args.ffn_hidden_size is None:
-            if args.swiglu:
+            if args.swiglu or args.swiglu_ffn_size:
                 # reduce the dimnesion for MLP since projections happens on
                 # two linear layers. this keeps the number of paramters in
                 # the same ballpark as the counterpart with 4*h size
@@ -483,7 +483,7 @@ def core_transformer_config_from_args(args):
     kw_args['pipeline_dtype'] = args.params_dtype
     kw_args['batch_p2p_comm'] = not args.overlap_p2p_comm
     if args.swiglu:
-        # kw_args['activation_func'] = F.silu
+        kw_args['activation_func'] = F.silu
         kw_args['gated_linear_unit'] = True
         kw_args['bias_gelu_fusion'] = False
     if args.init_method_xavier_uniform:
@@ -661,6 +661,8 @@ def _add_network_size_args(parser):
                        help='Use squared relu activation instead of default gelu')
     group.add_argument('--swiglu', action='store_true',
                        help='Use gated linear units and SiLU activation instead of default gelu')
+    group.add_argument('--swiglu-ffn-size', action='store_true',
+                       help="Do not use swiglu but use Swiglu's MLP default size ")
     group.add_argument('--onnx-safe', type=bool, required=False,
                        help='Use workarounds for known problems with '
                        'Torch ONNX exporter')
