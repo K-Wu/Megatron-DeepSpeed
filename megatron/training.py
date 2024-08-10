@@ -136,6 +136,8 @@ def get_tensor_cache(args):
     else:
         # adapter=adapters.TorchDummyIOAdapter(), 
         adapter=configs.get_adapter()
+    if args.disable_adaptive_keep_passive:
+        adapter.disable_adaptive_keep_passive = True
     tensor_cache = PTC.PipelineTensorCache(
         adaptive_keep=not args.disable_adaptive_keep,
         enable_activation_context_recording=args.deepspeed_activation_checkpointing or args.recompute_granularity is not None,
@@ -230,6 +232,9 @@ def pretrain(
         )
         group.add_argument(
             "--disable-adaptive-keep", action="store_true", default=False, help="Disable adaptive keep in PeakTrackNoIOLossyAdapter."
+        )
+        group.add_argument(
+            "--disable-adaptive-keep-passive", action="store_true", default=False, help="Disable adaptive keep in async_save_tensor in adapters ."
         )
         return parser
     
