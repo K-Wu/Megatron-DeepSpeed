@@ -144,7 +144,7 @@ def get_tensor_cache(args):
         adapter=adapter, 
         implicit_wait_and_set_backward=True,
         num_microbatches=get_num_microbatches(),
-        nvtx_enabled=args.profile_first_iter or args.profile_first_iter_longer or args.profile_memory or args.profile_memory_beginning,
+        nvtx_enabled=args.profile_unlimited or args.profile_first_iter or args.profile_first_iter_longer or args.profile_memory or args.profile_memory_beginning,
     )
     return tensor_cache
 
@@ -198,10 +198,16 @@ def pretrain(
             "--tensor-cache-reset-in-every-iteration", action="store_true", default=False
         )
         group.add_argument(
+            "--clear-memory-in-every-iteration", action="store_true", default=False
+        )
+        group.add_argument(
             "--tensor-cache-in-memory-adapter", action="store_true", default=False
         )
         group.add_argument(
             "--tensor-cache-log-level", type=str, default="ERROR", choices=["CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG", "NOTSET"]
+        )
+        group.add_argument(
+            "--profile-unlimited", action="store_true", default=False
         )
         group.add_argument(
             "--profile-first-iter", action="store_true", default=False
@@ -319,6 +325,8 @@ def pretrain(
     else:
         # logger.setLevel(logging.getLevelName("CRITICAL"))
         logging.disable()
+    
+    flashtrain.tensor_cache.init_timing_stats_recorder()
     if args.enable_tensor_cache:
         tensor_cache = get_tensor_cache(args)
         
@@ -1185,6 +1193,20 @@ def train_step(
     if args.empty_unused_memory_level >= 1:
         torch.cuda.empty_cache()
 
+    
+    if idx_iteration == 0:
+        # clear memory cache to make sure the memory measure here is accurate
+        torch.cuda.empty_cache()
+        get_memory_use_stats_recorder()["weight+weight_copies"] = torch.cuda.memory_allocated()
+        torch.cuda.reset_peak_memory_stats()
+    
+    
+    # Skip optimizer step if lossy first iteration
+    if (args.enable_tensor_cache and args.lossy_offload_first_iter and idx_iteration == 0):
+        return {}, 1, None, None
+    
+    optimizer.zero_grad(set_to_none=False)
+
     # Reduce gradients.
     if not args.deepspeed:
         optimizer.reduce_model_grads(args, timers)
@@ -1199,12 +1221,7 @@ def train_step(
     
     # Measure the 1st iteration memory use here for (weight + copies) 
     # Measure the 2nd iteration memory use peak here for activation memory use peak
-    if idx_iteration == 0:
-        # clear memory cache to make sure the memory measure here is accurate
-        torch.cuda.empty_cache()
-        get_memory_use_stats_recorder()["weight+weight_copies"] = torch.cuda.memory_allocated()
-        torch.cuda.reset_peak_memory_stats()
-    elif idx_iteration ==  1:
+    if idx_iteration ==  1:
         # clear memory cache to make sure the memory measure here is accurate
         torch.cuda.empty_cache()
     elif idx_iteration == 2:
@@ -1216,7 +1233,11 @@ def train_step(
     elif idx_iteration >2:
         get_memory_use_stats_recorder()["current_iter_activation"] = torch.cuda.max_memory_allocated() - get_memory_use_stats_recorder()["weight+weight_copies+optimizer_states"]
 
+
     # Update parameters.
+    torch.cuda.synchronize()
+    my_timers = flashtrain.tensor_cache.get_timing_stats_recorder()
+    my_timers["optimizer-start"] = time.time()
     timers("optimizer", log_level=1).start(barrier=args.barrier_with_L1_time)
     if args.deepspeed:
         increment = (
@@ -1776,6 +1797,7 @@ def training_log(
                 )
 
     if iteration % args.log_interval == 0:
+        torch.cuda.synchronize()
         elapsed_time = timers("interval-time").elapsed(barrier=True)
         elapsed_time_per_iteration = elapsed_time / total_iterations
         seq_len = args.seq_length
@@ -1839,6 +1861,25 @@ def training_log(
         log_string += " elapsed time per iteration (ms): {:.1f} |".format(
             elapsed_time_per_iteration * 1000.0
         )
+        # This commented out region is not working
+        # if args.timing_log_level >= 1:
+        #     elapsed_time_optimizer = timers("optimizer").elapsed(reset = False) / total_iterations
+        #     elapsed_time_forward_backward = timers("forward-backward").elapsed(reset = False) / total_iterations
+        #     log_string += " elapsed time optimizer (ms): {:.1f} |".format(
+        #         elapsed_time_optimizer * 1000.0
+        #     )
+        #     log_string += " elapsed time forward-backward (ms): {:.1f} |".format(
+        #         elapsed_time_forward_backward * 1000.0
+        #     )
+
+        if iteration >= 2:
+            my_timers = flashtrain.tensor_cache.get_timing_stats_recorder()
+            elapsed_time_since_optimizer_per_iteration = (time.time() -my_timers["optimizer-start"]) / total_iterations
+
+            log_string += " elapsed time since optimizer (ms): {:.1f} |".format(
+                elapsed_time_since_optimizer_per_iteration * 1000.0
+            )
+
         log_string += " learning rate: {:.3E} |".format(learning_rate)
         log_string += " global batch size: {:5d} |".format(batch_size)
         if wandb is not None and getattr(wandb, "run", None) is not None:
@@ -1986,6 +2027,7 @@ def train(
         config.grad_scale_func = optimizer.scale_loss
     config.timers = timers
 
+    torch.cuda.synchronize()
     timers("interval-time", log_level=0).start(barrier=True)
     print_datetime("before the start of training step")
     if args.random_ltd:
@@ -2307,10 +2349,20 @@ def train(
             sys.exit()
 
         # Clear up memory
-        # for m in model:
-        #     m.zero_grad(set_to_none=True)
-        # gc.collect()
-        # torch.cuda.empty_cache()
+        if args.clear_memory_in_every_iteration:
+            for m in model:
+                m.zero_grad(set_to_none=True)
+            gc.collect()
+            torch.cuda.empty_cache()
+        if args.enable_tensor_cache:
+            if isinstance(tensor_cache, PTC.PipelineTensorCache):
+                tensor_caches = tensor_cache.tensor_caches
+            else:
+                tensor_caches = [tensor_cache]
+            for tc_ in tensor_caches:
+                pass
+                tc_.wait_and_clear_queues()
+                tc_.offloader.engine.restart_executors()
         # if mpu.get_data_parallel_rank() == 0:
         #     print(torch.cuda.memory_summary(), flush=True)
 
