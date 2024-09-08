@@ -1205,7 +1205,7 @@ def train_step(
     if (args.enable_tensor_cache and args.lossy_offload_first_iter and idx_iteration == 0):
         return {}, 1, None, None
     
-    optimizer.zero_grad(set_to_none=False)
+    # optimizer.zero_grad(set_to_none=False)
 
     # Reduce gradients.
     if not args.deepspeed:
@@ -1955,6 +1955,7 @@ def training_log(
             if isinstance(tensor_cache, PTC.PipelineTensorCache):
                 tensor_cache = tensor_cache.tensor_caches[0]
             log_string += " [activation by pack hook (GB): {:.2f}]".format(tensor_cache.measured_activation_gpu_memory_size/1024/1024/1024)
+            log_string += " [activation by pack hook deduplicated (GB): {:.2f}]".format(tensor_cache.measured_activation_gpu_deduplicated_memory_size/1024/1024/1024)
             if args.cufile_malloc_hook_is_used:
                 cufile_malloc_hook = flashtrain.tensor_cache.get_cufile_malloc_hook()
                 log_string += " [cuFile malloc hook in use num_allocs: {} num_frees: {}]".format(cufile_malloc_hook.get_num_allocs(), cufile_malloc_hook.get_num_frees())
@@ -2362,7 +2363,7 @@ def train(
             for tc_ in tensor_caches:
                 pass
                 tc_.wait_and_clear_queues()
-                tc_.offloader.engine.restart_executors()
+                # tc_.offloader.engine.restart_executors()
         # if mpu.get_data_parallel_rank() == 0:
         #     print(torch.cuda.memory_summary(), flush=True)
 
